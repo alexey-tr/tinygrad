@@ -3,7 +3,7 @@ import ctypes, functools, mmap, queue, threading
 from tinygrad.helpers import to_mv, mv_address, Target
 from tinygrad.device import BufferSpec
 from tinygrad.dtype import dtypes, PtrDType, DType
-from tinygrad.uop.ops import Ops, UOp, GroupOp
+from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HCQArgsState, MMIOInterface
 from tinygrad.runtime.ops_cpu import CPUSignal, CPUWorker, CPUComputeQueue, CPUProgram
 from tinygrad.renderer.cstyle import ClangJITRenderer
@@ -95,49 +95,17 @@ class RKNPUAllocator(HCQAllocator):
 
 # *** RKNPU Renderer ***
 
-# NPU DPU-supported element-wise operations (extend as hardware support grows)
-_NPU_SUPPORTED_OPS = {Ops.MUL, Ops.ADD, Ops.SUB}
+# NPU function names for supported element-wise ops
+_NPU_FN = {Ops.MUL: "npu_mul", Ops.ADD: "npu_add", Ops.SUB: "npu_sub"}
 
-# Map from set of ALU ops to NPU function name
-_NPU_OP_NAMES = {
-  frozenset({Ops.MUL}): "npu_mul",
-  frozenset({Ops.ADD}): "npu_add",
-  frozenset({Ops.SUB}): "npu_sub",
-}
+# Post-devectorization shape: GEP(LOAD(CAST(INDEX(PARAM, ...))))
+_param_gep = UPat(Ops.GEP, src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),))
 
-def _classify_npu(uops: list[UOp]) -> dict | None:
-  """Analyze linearized UOps to determine if the kernel is NPU-accelerable.
-     Returns operation descriptor dict or None if not supported."""
-  params = [u for u in uops if u.op == Ops.PARAM]
-  if not params:
-    return None
-
-  # Collect float ALU ops (ignore integer index arithmetic)
-  compute_ops = {u.op for u in uops if u.op in GroupOp.ALU and u.dtype.scalar() == dtypes.half}
-
-  # All float computation must be NPU-supported
-  if not compute_ops or not compute_ops.issubset(_NPU_SUPPORTED_OPS):
-    return None
-
-  # All buffers must be fp16 pointers
-  if not all(isinstance(u.dtype, PtrDType) and u.dtype.base == dtypes.half for u in params):
-    return None
-
-  # Reject if computation involves fp16 constants (e.g. x * 2.0) — NPU does buffer-to-buffer only
-  if any(u.op == Ops.CONST and u.dtype.scalar() == dtypes.half for u in uops):
-    return None
-
-  # Validate buffer count: count unique LOADs (input buffers) + 1 output == total params
-  n_loads = sum(1 for u in uops if u.op == Ops.LOAD and u.dtype.scalar() == dtypes.half)
-  n_stores = sum(1 for u in uops if u.op == Ops.STORE)
-  if n_stores != 1 or len(params) != n_loads + 1:
-    return None
-
-  fn = _NPU_OP_NAMES.get(frozenset(compute_ops))
-  if fn is None:
-    return None
-
-  return {"fn": fn, "n_elements": params[0].dtype.size, "n_bufs": len(params)}
+# Pre-matcher: tag fp16 binary ALU ops whose operands both trace to PARAM loads.
+rknpu_pm = PatternMatcher([
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.half, name="u", src=(_param_gep, _param_gep)),
+   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[u.op])),
+])
 
 
 class RkCompiler(ClangJITCompiler):
@@ -145,22 +113,26 @@ class RkCompiler(ClangJITCompiler):
     return self.compile_to_obj(src)
 
 class RkRenderer(ClangJITRenderer):
+  pre_matcher = rknpu_pm
+
   def __init__(self, target: Target):
     super().__init__(target)
     self.compiler = RkCompiler()
 
   def render(self, uops: list[UOp]) -> str:
-    npu = _classify_npu(uops)
-    if npu is not None:
-      # NPU-accelerable: render an NPU kernel body that calls npu_mul/add/sub directly
+    # rknpu_pm rewrites eligible fp16 binary ALU ops to CUSTOM nodes tagged with the NPU fn name.
+    # If any such node survived to render time, this is an NPU-accelerable kernel.
+    npu_ops = [u for u in uops if u.op is Ops.CUSTOM and u.arg in _NPU_FN.values()]
+    if npu_ops:
+      fn = npu_ops[0].arg  # e.g. "npu_mul" — all ops in a chain share the same fn
       name, _kernel, bufs = self._render(uops)
-      names = [n for n, _ in bufs]
-      n = str(npu["n_elements"])
+      params = [u for u in uops if u.op is Ops.PARAM]
+      n = str(params[0].dtype.size)
 
       # Generate NPU dispatch body using fd + DMA args
-      body = [f"  {npu['fn']}(npu_fd, dma_0, obj_0, dma_1, dma_2, {n});"]
-      for i in range(3, len(names)):
-        body.append(f"  {npu['fn']}(npu_fd, dma_0, obj_0, dma_0, dma_{i}, {n});")
+      body = [f"  {fn}(npu_fd, dma_0, obj_0, dma_1, dma_2, {n});"]
+      for i in range(3, len(bufs)):
+        body.append(f"  {fn}(npu_fd, dma_0, obj_0, dma_0, dma_{i}, {n});")
       return self.render_kernel(name, body, bufs, uops)
 
     return super().render(uops)
