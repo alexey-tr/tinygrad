@@ -96,12 +96,13 @@ class RKNPUAllocator(HCQAllocator):
 # *** RKNPU Renderer ***
 
 # NPU DPU-supported element-wise operations (extend as hardware support grows)
-_NPU_SUPPORTED_OPS = {Ops.MUL, Ops.ADD}
+_NPU_SUPPORTED_OPS = {Ops.MUL, Ops.ADD, Ops.SUB}
 
 # Map from set of ALU ops to NPU function name
 _NPU_OP_NAMES = {
   frozenset({Ops.MUL}): "npu_mul",
   frozenset({Ops.ADD}): "npu_add",
+  frozenset({Ops.SUB}): "npu_sub",
 }
 
 def _classify_npu(uops: list[UOp]) -> dict | None:
@@ -201,9 +202,9 @@ class RkRenderer(ClangJITRenderer):
     else:
       # CPU kernel: render inner function, wrap with outer that forwards VA args
       inner_body = self._render_body(function_name, kernel, bufs, uops, prefix)
-      inner_body = inner_body.replace(f"void {function_name}(", f"static void {function_name}_inner(", 1)
+      inner_body = inner_body.replace(f"void {function_name}(", f"static void cpu_{function_name}(", 1)
       inner_args = ', '.join([name for name, _ in bufs])
-      entry = f"void {function_name}({', '.join(ex_params)}) {{\n  {function_name}_inner({inner_args});\n}}"
+      entry = f"void {function_name}({', '.join(ex_params)}) {{\n  cpu_{function_name}({inner_args});\n}}"
       return f"{defines}\n{inner_body}\n{entry}"
 
 
