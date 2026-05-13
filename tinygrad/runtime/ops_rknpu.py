@@ -48,6 +48,15 @@ for _fn in ['npu_mul', 'npu_add', 'npu_sub']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
+# void npu_mul/add/sub_scalar(int fd, uint64_t dst_dma, uint64_t dst_obj, uint64_t src_dma, _Float16 scalar, int elements)
+for _fn in ['npu_mul_scalar', 'npu_add_scalar', 'npu_sub_scalar']:
+  getattr(_lib, _fn).restype = None
+  getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint16, ctypes.c_int]
+
+# void npu_neg(int fd, uint64_t dst_dma, uint64_t dst_obj, uint64_t src_dma, int elements)
+_lib.npu_neg.restype = None
+_lib.npu_neg.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+
 # void mem_destroy(int fd, uint32_t handle, uint64_t obj_addr)
 _lib.mem_destroy.restype = None
 _lib.mem_destroy.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64]
@@ -97,14 +106,24 @@ class RKNPUAllocator(HCQAllocator):
 
 # NPU function names for supported element-wise ops
 _NPU_FN = {Ops.MUL: "npu_mul", Ops.ADD: "npu_add", Ops.SUB: "npu_sub"}
+# Scalar variants (one operand is a fp16 constant)
+_NPU_FN_SCALAR = {Ops.MUL: "npu_mul_scalar", Ops.ADD: "npu_add_scalar", Ops.SUB: "npu_sub_scalar"}
 
 # Post-devectorization shape: GEP(LOAD(CAST(INDEX(PARAM, ...))))
 _param_gep = UPat(Ops.GEP, src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),))
+_const_fp16 = UPat(Ops.CONST, dtype=dtypes.half, name="c")
 
-# Pre-matcher: tag fp16 binary ALU ops whose operands both trace to PARAM loads.
+# Pre-matcher: tag fp16 ALU ops whose operands trace to PARAM loads.
 rknpu_pm = PatternMatcher([
+  # vector OP vector
   (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.half, name="u", src=(_param_gep, _param_gep)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[u.op])),
+  # vector OP scalar  (note: `scalar - vector` is canonicalized by tinygrad to `v*(-1)+scalar`)
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.half, name="u", src=(_param_gep, _const_fp16)),
+   lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[u.op])),
+  # unary negate
+  (UPat(Ops.NEG, dtype=dtypes.half, name="u", src=(_param_gep,)),
+   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, "npu_neg")),
 ])
 
 
@@ -120,19 +139,33 @@ class RkRenderer(ClangJITRenderer):
     self.compiler = RkCompiler()
 
   def render(self, uops: list[UOp]) -> str:
-    # rknpu_pm rewrites eligible fp16 binary ALU ops to CUSTOM nodes tagged with the NPU fn name.
+    # rknpu_pm rewrites eligible fp16 ALU ops to CUSTOM nodes tagged with the NPU fn name.
     # If any such node survived to render time, this is an NPU-accelerable kernel.
-    npu_ops = [u for u in uops if u.op is Ops.CUSTOM and u.arg in _NPU_FN.values()]
+    _all_npu_fns = set(_NPU_FN.values()) | set(_NPU_FN_SCALAR.values()) | {"npu_neg"}
+    npu_ops = [u for u in uops if u.op is Ops.CUSTOM and u.arg in _all_npu_fns]
     if npu_ops:
-      fn = npu_ops[0].arg  # e.g. "npu_mul" — all ops in a chain share the same fn
+      fn = npu_ops[0].arg
       name, _kernel, bufs = self._render(uops)
       params = [u for u in uops if u.op is Ops.PARAM]
       n = str(params[0].dtype.size)
 
-      # Generate NPU dispatch body using fd + DMA args
-      body = [f"  {fn}(npu_fd, dma_0, obj_0, dma_1, dma_2, {n});"]
-      for i in range(3, len(bufs)):
-        body.append(f"  {fn}(npu_fd, dma_0, obj_0, dma_0, dma_{i}, {n});")
+      body = []
+      if fn == "npu_neg":
+        # unary: npu_neg(fd, dst_dma, dst_obj, src_dma, n)
+        body.append(f"  npu_neg(npu_fd, dma_0, obj_0, dma_1, {n});")
+      elif fn in _NPU_FN_SCALAR.values():
+        # scalar: second src is a CONST — embed literal; only one buffer besides dst
+        # The CUSTOM node src[0]=param_gep, src[1]=CONST
+        # bufs[0]=dst, bufs[1]=src; scalar value comes from the CONST UOp
+        const_ops = [u for u in uops if u.op is Ops.CONST and u.dtype == dtypes.half]
+        # Emit scalar as a __fp16 float literal — the compiler handles the conversion correctly
+        scalar_f = float(const_ops[0].arg) if const_ops else 0.0
+        body.append(f"  {fn}(npu_fd, dma_0, obj_0, dma_1, (__fp16){scalar_f!r}f, {n});")
+      else:
+        # vector OP vector
+        body.append(f"  {fn}(npu_fd, dma_0, obj_0, dma_1, dma_2, {n});")
+        for i in range(3, len(bufs)):
+          body.append(f"  {fn}(npu_fd, dma_0, obj_0, dma_0, dma_{i}, {n});")
       return self.render_kernel(name, body, bufs, uops)
 
     return super().render(uops)
@@ -143,6 +176,10 @@ class RkRenderer(ClangJITRenderer):
       'void npu_mul(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_add(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_sub(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
+      'void npu_mul_scalar(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __fp16 scalar, int elements);',
+      'void npu_add_scalar(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __fp16 scalar, int elements);',
+      'void npu_sub_scalar(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __fp16 scalar, int elements);',
+      'void npu_neg(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, int elements);',
     ]
     return defines
 
