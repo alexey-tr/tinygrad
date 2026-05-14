@@ -231,8 +231,10 @@ class RKNPUComputeQueue(CPUComputeQueue):
     import platform
     va_args = list(map(ctypes.c_uint64, args[:bufs]))
     dma_args = list(map(ctypes.c_uint64, args[bufs:bufs+n_dma]))
-    vals = list(map(ctypes.c_int64 if platform.machine() == "arm64" else ctypes.c_int32, args[bufs+n_dma:]))
-    prg.fxn(*va_args, *dma_args, *vals, ctypes.c_int(dev_fd))
+    vals = list(args[bufs+n_dma:])
+    if 'core_id' in prg.runtimevars: vals[prg.runtimevars['core_id']] = tid
+    vals_mapped = list(map(ctypes.c_int64 if platform.machine() == "arm64" else ctypes.c_int32, vals))
+    prg.fxn(*va_args, *vals_mapped, *dma_args, ctypes.c_int(dev_fd))
 
   def exec(self, prg, args_state:HCQArgsState, global_size, local_size):
     # Extract DMA/OBJ from HCQBuffer.meta for each pointer buffer
@@ -242,7 +244,7 @@ class RKNPUComputeQueue(CPUComputeQueue):
       dma_args.extend([dma_addr, obj_addr])
     dev_fd = args_state.bufs[0].owner.fd
     return self.cmd(self._rknpu_exec, prg, dev_fd, len(args_state.bufs), len(dma_args),
-                    *[x.va_addr for x in args_state.bufs], *dma_args, *args_state.vals)
+                    *[x.va_addr for x in args_state.bufs], *dma_args, *args_state.vals, threads=(global_size or (1,))[0])
 
 
 # *** RKNPU Device ***
