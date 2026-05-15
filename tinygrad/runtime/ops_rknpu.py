@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, functools, mmap, queue, threading
+import ctypes, functools, mmap, queue, threading, math
 from tinygrad.helpers import to_mv, mv_address, Target
 from tinygrad.device import BufferSpec
 from tinygrad.dtype import dtypes, PtrDType, DType
@@ -73,6 +73,10 @@ def _mem_allocate(fd: int, size: int, flags: int = 0):
   return int(va), int(dma_addr.value), int(obj_addr.value), int(handle.value)
 
 
+libc = ctypes.CDLL("libc.so.6")
+libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+libc.munmap.restype = ctypes.c_int
+
 def _mem_destroy(fd: int, handle: int, obj_addr: int):
   """Free DMA memory allocated by mem_allocate."""
   _lib.mem_destroy(fd, handle, obj_addr)
@@ -85,14 +89,17 @@ class RKNPUAllocator(HCQAllocator):
     super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
 
   def _alloc(self, size: int, options: BufferSpec) -> HCQBuffer:
-    va, dma_addr, obj_addr, handle = _mem_allocate(self.dev.fd, size)
+    # rknpu driver requires page-aligned size for mmap when using NON_CONTIGUOUS
+    aligned_size = (size + 4095) & ~4095
+    # RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_IOMMU | RKNPU_MEM_WRITE_COMBINE = 1 | 16 | 4 = 21
+    va, dma_addr, obj_addr, handle = _mem_allocate(self.dev.fd, aligned_size, flags=21)
     view = MMIOInterface(va, size, fmt='B')
-    return HCQBuffer(va_addr=va, size=size, meta=(handle, obj_addr, dma_addr, size), view=view, owner=self.dev)
+    return HCQBuffer(va_addr=va, size=size, meta=(handle, obj_addr, dma_addr, aligned_size), view=view, owner=self.dev)
 
   def _do_free(self, buf: HCQBuffer, options: BufferSpec | None = None):
-    handle, obj_addr, _dma_addr, size = buf.meta
+    handle, obj_addr, _dma_addr, aligned_size = buf.meta
     # munmap the userspace mapping before destroying the kernel object
-    ctypes.cdll.LoadLibrary("libc.so.6").munmap(ctypes.c_void_p(buf.va_addr), ctypes.c_size_t(size))
+    ctypes.cdll.LoadLibrary("libc.so.6").munmap(ctypes.c_void_p(buf.va_addr), ctypes.c_size_t(aligned_size))
     _mem_destroy(self.dev.fd, handle, obj_addr)
 
   def _as_buffer(self, src: HCQBuffer) -> memoryview:
@@ -134,6 +141,13 @@ class RkCompiler(ClangJITCompiler):
 class RkRenderer(ClangJITRenderer):
   pre_matcher = rknpu_pm
 
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"({ctx[x.src[0]]} * {ctx[x.src[1]]})" if x.arg in ("npu_mul", "npu_mul_scalar") else None),
+    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"({ctx[x.src[0]]} + {ctx[x.src[1]]})" if x.arg in ("npu_add", "npu_add_scalar") else None),
+    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"({ctx[x.src[0]]} - {ctx[x.src[1]]})" if x.arg in ("npu_sub", "npu_sub_scalar") else None),
+    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"(-{ctx[x.src[0]]})" if x.arg == "npu_neg" else None),
+  ]) + ClangJITRenderer.string_rewrite
+
   def __init__(self, target: Target):
     super().__init__(target)
     self.compiler = RkCompiler()
@@ -143,16 +157,18 @@ class RkRenderer(ClangJITRenderer):
     # If any such node survived to render time, this is an NPU-accelerable kernel.
     _all_npu_fns = set(_NPU_FN.values()) | set(_NPU_FN_SCALAR.values()) | {"npu_neg"}
     npu_ops = [u for u in uops if u.op is Ops.CUSTOM and u.arg in _all_npu_fns]
-    if npu_ops:
+    has_loops = any(u.op is Ops.RANGE for u in uops)
+    if npu_ops and not has_loops:
       fn = npu_ops[0].arg
       name, _kernel, bufs = self._render(uops)
+      ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
       params = [u for u in uops if u.op is Ops.PARAM]
       n = str(params[0].dtype.size)
 
       body = []
       if fn == "npu_neg":
         # unary: npu_neg(fd, dst_dma, dst_obj, src_dma, n)
-        body.append(f"  npu_neg(npu_fd, dma_0, obj_0, dma_1, {n});")
+        body.append(f"  npu_neg(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[1]}, {n});")
       elif fn in _NPU_FN_SCALAR.values():
         # scalar: second src is a CONST — embed literal; only one buffer besides dst
         # The CUSTOM node src[0]=param_gep, src[1]=CONST
@@ -160,12 +176,15 @@ class RkRenderer(ClangJITRenderer):
         const_ops = [u for u in uops if u.op is Ops.CONST and u.dtype == dtypes.half]
         # Emit scalar as a __fp16 float literal — the compiler handles the conversion correctly
         scalar_f = float(const_ops[0].arg) if const_ops else 0.0
-        body.append(f"  {fn}(npu_fd, dma_0, obj_0, dma_1, (__fp16){scalar_f!r}f, {n});")
+        if math.isinf(scalar_f): scalar_str = "-__builtin_inff()" if scalar_f < 0 else "__builtin_inff()"
+        elif math.isnan(scalar_f): scalar_str = '__builtin_nanf("")'
+        else: scalar_str = f"{scalar_f!r}f"
+        body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[1]}, (__fp16){scalar_str}, {n});")
       else:
         # vector OP vector
-        body.append(f"  {fn}(npu_fd, dma_0, obj_0, dma_1, dma_2, {n});")
-        for i in range(3, len(bufs)):
-          body.append(f"  {fn}(npu_fd, dma_0, obj_0, dma_0, dma_{i}, {n});")
+        body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[1]}, dma_{ptr_indices[2]}, {n});")
+        for i in ptr_indices[3:]:
+          body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[0]}, dma_{i}, {n});")
       return self.render_kernel(name, body, bufs, uops)
 
     return super().render(uops)
@@ -240,9 +259,12 @@ class RKNPUComputeQueue(CPUComputeQueue):
     # Extract DMA/OBJ from HCQBuffer.meta for each pointer buffer
     dma_args = []
     for buf in args_state.bufs:
-      _handle, obj_addr, dma_addr, _size = buf.meta
+      if buf.meta is not None:
+        _handle, obj_addr, dma_addr, _size = buf.meta
+      else:
+        obj_addr, dma_addr = 0, 0
       dma_args.extend([dma_addr, obj_addr])
-    dev_fd = args_state.bufs[0].owner.fd
+    dev_fd = prg.dev.fd
     return self.cmd(self._rknpu_exec, prg, dev_fd, len(args_state.bufs), len(dma_args),
                     *[x.va_addr for x in args_state.bufs], *dma_args, *args_state.vals, threads=(global_size or (1,))[0])
 
