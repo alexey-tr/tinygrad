@@ -286,11 +286,11 @@ class RKNPUCopyQueue(CPUComputeQueue):
   """Copy queue that uses npu_add_scalar(src, 0, n) as a hardware-accelerated buffer copy for fp16 data."""
   def __init__(self, **kwargs):
     super().__init__()  # HWQueue doesn't accept kwargs; ignore queue_idx from HCQGraph
-  def _npu_copy(self, tid, fd, dst_va, src_va, dst_dma, dst_obj, src_dma, nbytes, same_dev, is_fp16):
+  def _npu_copy(self, tid, fd, dst_va, src_va, dst_dma, dst_obj, src_dma, nbytes, is_fp16):
     elements = nbytes // 2  # fp16 elements
-    # NPU copy only works for fp16 data on the same device fd (driver tracks object ownership per-fd).
+    # NPU copy only works for fp16 data; all RKNPU buffers share one fd so no cross-fd concern.
     # Using npu_add_scalar on non-fp16 data corrupts it (DPU is hardwired for fp16 precision).
-    can_npu = is_fp16 and same_dev and dst_dma != 0 and src_dma != 0 and fd != 0 and elements > 0 and nbytes >= _COPY_NPU_MIN_BYTES
+    can_npu = is_fp16 and dst_dma != 0 and src_dma != 0 and fd != 0 and elements > 0 and nbytes >= _COPY_NPU_MIN_BYTES
     if can_npu:
       # Hardware copy: dst = src + 0  (identity via NPU pipeline)
       _lib.npu_add_scalar(fd, dst_dma, dst_obj, src_dma, 0, elements)
@@ -312,14 +312,12 @@ class RKNPUCopyQueue(CPUComputeQueue):
       _sh, _sobj, src_dma, _ = src.meta
     else:
       src_dma = 0
-    # NPU copy requires both buffers on the same device fd (driver tracks object ownership per-fd).
-    # Cross-device copies have valid DMA addresses but registered to different fds → SUBMIT FAILED.
+    # All RKNPU device instances share one fd, so any RKNPU buffer is valid for NPU submission.
     fd = dest.owner.fd if (dest.owner and hasattr(dest.owner, 'fd')) else 0
-    same_dev = dest.owner is not None and src.owner is not None and dest.owner is src.owner
     # Only use NPU path for fp16 buffers — the DPU pipeline is hardwired for fp16 precision.
     from tinygrad.dtype import dtypes
     is_fp16 = dest.dtype == dtypes.half if hasattr(dest, 'dtype') and dest.dtype is not None else False
-    return self.cmd(self._npu_copy, fd, dest.va_addr, src.va_addr, dst_dma, dst_obj, src_dma, copy_size, same_dev, is_fp16)
+    return self.cmd(self._npu_copy, fd, dest.va_addr, src.va_addr, dst_dma, dst_obj, src_dma, copy_size, is_fp16)
 
   def _submit(self, dev):
     # Submit to the device's copy_tasks queue (separate worker thread) to avoid deadlock
@@ -340,10 +338,18 @@ class RKNPUSignal(CPUSignal):
 
 
 class RKNPUDevice(HCQCompiled):
+  _shared_fd: int = -1
+  _fd_refcount: int = 0
+  _fd_lock: threading.Lock = threading.Lock()
+
   def __init__(self, device: str = ""):
-    self.fd: int = _lib.npu_open()
-    if self.fd < 0:
-      raise RuntimeError(f"npu_open() failed, fd={self.fd}. Is /dev/dri/card1 accessible?")
+    with RKNPUDevice._fd_lock:
+      if RKNPUDevice._shared_fd < 0:
+        RKNPUDevice._shared_fd = _lib.npu_open()
+        if RKNPUDevice._shared_fd < 0:
+          raise RuntimeError(f"npu_open() failed, fd={RKNPUDevice._shared_fd}. Is /dev/dri/card1 accessible?")
+      RKNPUDevice._fd_refcount += 1
+      self.fd: int = RKNPUDevice._shared_fd
 
     # Compute queue worker
     self.tasks: queue.Queue = queue.Queue()
@@ -365,4 +371,10 @@ class RKNPUDevice(HCQCompiled):
 
   def finalize(self):
     super().finalize()
-    _lib.npu_close(self.fd)
+    with RKNPUDevice._fd_lock:
+      RKNPUDevice._fd_refcount -= 1
+      fd_to_close = RKNPUDevice._shared_fd if RKNPUDevice._fd_refcount == 0 else -1
+      if fd_to_close >= 0:
+        RKNPUDevice._shared_fd = -1
+    if fd_to_close >= 0:
+      _lib.npu_close(fd_to_close)
