@@ -139,6 +139,10 @@ class TestProfiler(unittest.TestCase):
 
   @unittest.skipIf(CI or not issubclass(type(Device[Device.DEFAULT]), HCQCompiled), "skip CI")
   def test_dev_jitter_matrix(self):
+    from tinygrad.runtime.ops_cpu import CPUSignal
+    # CPUSignal timestamps are taken by separate worker threads using time.perf_counter_ns().
+    # Thread scheduling jitter (~100µs) makes sub-microsecond cross-device clock sync impossible.
+    if issubclass(Device[Device.DEFAULT].signal_t, CPUSignal): raise unittest.SkipTest("CPUSignal has no HW timestamp counter")
     dev_cnt = 6
     try: devs = [Device[f"{Device.DEFAULT}:{i}"] for i in range(dev_cnt)]
     except Exception as e: self.skipTest(f"multiple devices not available {e}")

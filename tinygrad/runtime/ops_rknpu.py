@@ -1,11 +1,11 @@
 from __future__ import annotations
 import ctypes, functools, mmap, queue, threading, math
-from tinygrad.helpers import to_mv, mv_address, Target
+from tinygrad.helpers import to_mv, from_mv, mv_address, cpu_profile, Target
 from tinygrad.device import BufferSpec
 from tinygrad.dtype import dtypes, PtrDType, DType
 from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HCQArgsState, MMIOInterface
-from tinygrad.runtime.ops_cpu import CPUSignal, CPUWorker, CPUComputeQueue, CPUProgram
+from tinygrad.runtime.ops_cpu import CPUSignal, CPUWorker, CPUComputeQueue, CPUProgram, _in_worker_task
 from tinygrad.renderer.cstyle import ClangJITRenderer
 from tinygrad.renderer.llvmir import CPULLVMRenderer
 from tinygrad.runtime.support.compiler_cpu import ClangJITCompiler
@@ -86,7 +86,7 @@ def _mem_destroy(fd: int, handle: int, obj_addr: int):
 
 class RKNPUAllocator(HCQAllocator):
   def __init__(self, dev: RKNPUDevice):
-    super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
+    super().__init__(dev, supports_copy_from_disk=False, supports_transfer=True)
 
   def _alloc(self, size: int, options: BufferSpec) -> HCQBuffer:
     # rknpu driver requires page-aligned size for mmap when using NON_CONTIGUOUS
@@ -105,6 +105,17 @@ class RKNPUAllocator(HCQAllocator):
   def _as_buffer(self, src: HCQBuffer) -> memoryview:
     self.dev.synchronize()
     return to_mv(src.va_addr, src.size)
+
+  # Override _copyin/_copyout to use direct memmove. The base HCQAllocator would use hw_copy_queue_t
+  # (RKNPUCopyQueue), which runs npu_add_scalar and treats all data as fp16 — corrupting non-fp16 buffers.
+  # RKNPU memory is CPU-accessible (unified address space), so memmove works directly.
+  def _copyin(self, dest: HCQBuffer, src: memoryview):
+    self.dev.synchronize()
+    with cpu_profile(f'TINY -> {self.dev.device}', f"{self.dev.device}:COPY"): ctypes.memmove(int(dest.va_addr), from_mv(src), len(src))
+
+  def _copyout(self, dest: memoryview, src: HCQBuffer):
+    self.dev.synchronize()
+    with cpu_profile(f'{self.dev.device} -> TINY', f"{self.dev.device}:COPY"): ctypes.memmove(from_mv(dest), int(src.va_addr), len(dest))
 
   def _map(self, buf: HCQBuffer): return None  # unified address space, no extra mapping needed
 
@@ -268,8 +279,65 @@ class RKNPUComputeQueue(CPUComputeQueue):
     return self.cmd(self._rknpu_exec, prg, dev_fd, len(args_state.bufs), len(dma_args),
                     *[x.va_addr for x in args_state.bufs], *dma_args, *args_state.vals, threads=(global_size or (1,))[0])
 
+# Minimum byte size to use NPU for copy; below this threshold, memmove is faster
+_COPY_NPU_MIN_BYTES = 4096
+
+class RKNPUCopyQueue(CPUComputeQueue):
+  """Copy queue that uses npu_add_scalar(src, 0, n) as a hardware-accelerated buffer copy for fp16 data."""
+  def __init__(self, **kwargs):
+    super().__init__()  # HWQueue doesn't accept kwargs; ignore queue_idx from HCQGraph
+  def _npu_copy(self, tid, fd, dst_va, src_va, dst_dma, dst_obj, src_dma, nbytes, same_dev, is_fp16):
+    elements = nbytes // 2  # fp16 elements
+    # NPU copy only works for fp16 data on the same device fd (driver tracks object ownership per-fd).
+    # Using npu_add_scalar on non-fp16 data corrupts it (DPU is hardwired for fp16 precision).
+    can_npu = is_fp16 and same_dev and dst_dma != 0 and src_dma != 0 and fd != 0 and elements > 0 and nbytes >= _COPY_NPU_MIN_BYTES
+    if can_npu:
+      # Hardware copy: dst = src + 0  (identity via NPU pipeline)
+      _lib.npu_add_scalar(fd, dst_dma, dst_obj, src_dma, 0, elements)
+      # Handle trailing odd byte with CPU fallback
+      if nbytes % 2:
+        ctypes.memmove(dst_va + nbytes - 1, src_va + nbytes - 1, 1)
+    else:
+      # Fallback: CPU memmove (cross-device, small copy, non-fp16, or non-RKNPU buffer)
+      ctypes.memmove(dst_va, src_va, nbytes)
+
+  def copy(self, dest: HCQBuffer, src: HCQBuffer, copy_size: int):
+    # Extract DMA metadata from both buffers.
+    # Source may be a non-RKNPU buffer (e.g. CPU) where meta is not a 4-tuple — fall back to memmove.
+    if isinstance(dest.meta, tuple) and len(dest.meta) == 4:
+      _dh, dst_obj, dst_dma, _ = dest.meta
+    else:
+      dst_obj, dst_dma = 0, 0
+    if isinstance(src.meta, tuple) and len(src.meta) == 4:
+      _sh, _sobj, src_dma, _ = src.meta
+    else:
+      src_dma = 0
+    # NPU copy requires both buffers on the same device fd (driver tracks object ownership per-fd).
+    # Cross-device copies have valid DMA addresses but registered to different fds → SUBMIT FAILED.
+    fd = dest.owner.fd if (dest.owner and hasattr(dest.owner, 'fd')) else 0
+    same_dev = dest.owner is not None and src.owner is not None and dest.owner is src.owner
+    # Only use NPU path for fp16 buffers — the DPU pipeline is hardwired for fp16 precision.
+    from tinygrad.dtype import dtypes
+    is_fp16 = dest.dtype == dtypes.half if hasattr(dest, 'dtype') and dest.dtype is not None else False
+    return self.cmd(self._npu_copy, fd, dest.va_addr, src.va_addr, dst_dma, dst_obj, src_dma, copy_size, same_dev, is_fp16)
+
+  def _submit(self, dev):
+    # Submit to the device's copy_tasks queue (separate worker thread) to avoid deadlock
+    # with the compute queue which runs on dev.tasks
+    dev.copy_tasks.put(self._q[:])
+
 
 # *** RKNPU Device ***
+
+class RKNPUSignal(CPUSignal):
+  def _sleep(self, time_spent_since_last_sleep_ms: int):
+    if self.is_timeline and self.owner is not None and not getattr(_in_worker_task, 'active', False):
+      # Also drain copy_tasks: HCQGraph submits copies to a separate worker thread, so a compute
+      # kernel could start before its copy dependency finishes without this join.
+      self.owner.tasks.join()
+      self.owner.copy_tasks.join()
+      if self.owner.error_state is not None: raise self.owner.error_state
+
 
 class RKNPUDevice(HCQCompiled):
   def __init__(self, device: str = ""):
@@ -277,16 +345,22 @@ class RKNPUDevice(HCQCompiled):
     if self.fd < 0:
       raise RuntimeError(f"npu_open() failed, fd={self.fd}. Is /dev/dri/card1 accessible?")
 
+    # Compute queue worker
     self.tasks: queue.Queue = queue.Queue()
     CPUWorker(self, self.tasks, thread_id=0).start()
+
+    # Copy queue worker (separate thread to avoid deadlock with compute queue in HCQGraph)
+    self.copy_tasks: queue.Queue = queue.Queue()
+    CPUWorker(self, self.copy_tasks, thread_id=0).start()
 
     super().__init__(
       device,
       RKNPUAllocator(self),
       [RkRenderer, ClangJITRenderer, CPULLVMRenderer],
       functools.partial(RKNPUProgram, self),
-      CPUSignal,
+      RKNPUSignal,
       RKNPUComputeQueue,
+      RKNPUCopyQueue,
     )
 
   def finalize(self):

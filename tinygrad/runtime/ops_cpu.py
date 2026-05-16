@@ -11,9 +11,14 @@ from tinygrad.renderer.nir import LVPRenderer
 from tinygrad.runtime.support.elf import jit_loader
 from tinygrad.uop.ops import sint
 
+# Per-thread flag: True while a CPUWorker is executing a task from the queue.
+# _sleep must not call tasks.join() from within a worker task — that would deadlock
+# because the current task hasn't called task_done() yet.
+_in_worker_task = threading.local()
+
 class CPUSignal(HCQSignal):
   def _sleep(self, time_spent_since_last_sleep_ms:int):
-    if self.is_timeline and self.owner is not None:
+    if self.is_timeline and self.owner is not None and not getattr(_in_worker_task, 'active', False):
       self.owner.tasks.join()
       if self.owner.error_state is not None: raise self.owner.error_state
 
@@ -31,6 +36,7 @@ class CPUWorker(threading.Thread):
   def run(self):
     while True:
       cmd_iter = iter(self.tasks.get())
+      _in_worker_task.active = True
       try:
         for cmd in cmd_iter:
           threads, args_cnt = next(cmd_iter), next(cmd_iter)
@@ -39,7 +45,9 @@ class CPUWorker(threading.Thread):
           cmd(self.thread_id, *args)
           for th in range(threads - 1): self.pool[th].join()
       except Exception as e: self.dev.error_state = e
-      finally: self.tasks.task_done()
+      finally:
+        _in_worker_task.active = False
+        self.tasks.task_done()
 
 class CPUComputeQueue(HWQueue):
   def _exec(self, tid, prg, bufs, *args):
