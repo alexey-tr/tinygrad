@@ -237,9 +237,11 @@ class RkRenderer(ClangJITRenderer):
         return super().render(uops)
       params = [u for u in uops if u.op is Ops.PARAM]
       n_elem = params[0].dtype.size
-      # NPU geometry uses c=8 channels minimum. Buffers smaller than 8 elements force the DPU
-      # to read/write past the allocation, which is unreliable on fp32 in-place ops. Fall back.
-      if n_elem < 8:
+      # The DPU writes one 16-byte-aligned pixel slot at a time, so the per-dtype channel
+      # count is 16/element_bytes: fp16/bf16=8, int8=16, fp32=4 (fp32 isn't acceleratable
+      # anyway). Buffers smaller than one full pixel force out-of-bounds DMA — fall back.
+      min_elem = 16 if fn.endswith('_i8') else 8
+      if n_elem < min_elem:
         return super().render(uops)
       n = str(n_elem)
 
