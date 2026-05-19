@@ -32,6 +32,10 @@ _lib.npu_close.argtypes = [ctypes.c_int]
 _lib.npu_reset.restype = ctypes.c_int
 _lib.npu_reset.argtypes = [ctypes.c_int]
 
+# void npu_drain(int fd) — synchronizes the async submission pipeline
+_lib.npu_drain.restype = None
+_lib.npu_drain.argtypes = [ctypes.c_int]
+
 # void* mem_allocate(int fd, size_t size, uint64_t *dma_addr, uint64_t *obj, uint32_t flags, uint32_t *handle)
 _lib.mem_allocate.restype = ctypes.c_void_p
 _lib.mem_allocate.argtypes = [
@@ -496,6 +500,10 @@ class RKNPUSignal(CPUSignal):
       # kernel could start before its copy dependency finishes without this join.
       self.owner.tasks.join()
       self.owner.copy_tasks.join()
+      # tasks.join only guarantees all kernels were submitted; the NPU may still be running
+      # them async. npu_drain submits a blocking barrier that returns once the per-core
+      # todo_list FIFO has fully drained.
+      _lib.npu_drain(self.owner.fd)
       if self.owner.error_state is not None: raise self.owner.error_state
 
 
