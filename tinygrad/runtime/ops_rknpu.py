@@ -47,13 +47,13 @@ _lib.mem_allocate.argtypes = [
   ctypes.POINTER(ctypes.c_uint32),  # handle
 ]
 
-# void npu_mul/add/sub(int fd, uint64_t dst_dma, uint64_t dst_obj, uint64_t srcA_dma, uint64_t srcB_dma, int elements)
-for _fn in ['npu_mul', 'npu_add', 'npu_sub']:
+# void npu_mul/add/sub/max(int fd, uint64_t dst_dma, uint64_t dst_obj, uint64_t srcA_dma, uint64_t srcB_dma, int elements)
+for _fn in ['npu_mul', 'npu_add', 'npu_sub', 'npu_max']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
-# void npu_mul/add/sub_scalar(int fd, uint64_t dst_dma, uint64_t dst_obj, uint64_t src_dma, _Float16 scalar, int elements)
-for _fn in ['npu_mul_scalar', 'npu_add_scalar', 'npu_sub_scalar']:
+# void npu_mul/add/sub/max_scalar(int fd, uint64_t dst_dma, uint64_t dst_obj, uint64_t src_dma, _Float16 scalar, int elements)
+for _fn in ['npu_mul_scalar', 'npu_add_scalar', 'npu_sub_scalar', 'npu_max_scalar']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint16, ctypes.c_int]
 
@@ -75,7 +75,7 @@ _lib.npu_neg_f32.restype = None
 _lib.npu_neg_f32.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
 # int8 vector-vector and unary
-for _fn in ['npu_mul_i8', 'npu_add_i8', 'npu_sub_i8']:
+for _fn in ['npu_mul_i8', 'npu_add_i8', 'npu_sub_i8', 'npu_max_i8']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
@@ -83,11 +83,11 @@ _lib.npu_neg_i8.restype = None
 _lib.npu_neg_i8.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
 # int16 vector-vector, scalar, and unary
-for _fn in ['npu_mul_i16', 'npu_add_i16', 'npu_sub_i16']:
+for _fn in ['npu_mul_i16', 'npu_add_i16', 'npu_sub_i16', 'npu_max_i16']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
-for _fn in ['npu_mul_scalar_i16', 'npu_add_scalar_i16', 'npu_sub_scalar_i16']:
+for _fn in ['npu_mul_scalar_i16', 'npu_add_scalar_i16', 'npu_sub_scalar_i16', 'npu_max_scalar_i16']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int16, ctypes.c_int]
 
@@ -95,11 +95,11 @@ _lib.npu_neg_i16.restype = None
 _lib.npu_neg_i16.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
 # bf16 vector-vector, scalar, and unary (scalar binding uses c_uint16 — bit-compatible with __bf16, see fp16 above)
-for _fn in ['npu_mul_bf16', 'npu_add_bf16', 'npu_sub_bf16']:
+for _fn in ['npu_mul_bf16', 'npu_add_bf16', 'npu_sub_bf16', 'npu_max_bf16']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
-for _fn in ['npu_mul_scalar_bf16', 'npu_add_scalar_bf16', 'npu_sub_scalar_bf16']:
+for _fn in ['npu_mul_scalar_bf16', 'npu_add_scalar_bf16', 'npu_sub_scalar_bf16', 'npu_max_scalar_bf16']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint16, ctypes.c_int]
 
@@ -176,15 +176,19 @@ _NPU_FN = {
   (Ops.MUL, dtypes.half):  "npu_mul",
   (Ops.ADD, dtypes.half):  "npu_add",
   (Ops.SUB, dtypes.half):  "npu_sub",
+  (Ops.MAX, dtypes.half):  "npu_max",
   (Ops.MUL, dtypes.int8):  "npu_mul_i8",
   (Ops.ADD, dtypes.int8):  "npu_add_i8",
   (Ops.SUB, dtypes.int8):  "npu_sub_i8",
+  (Ops.MAX, dtypes.int8):  "npu_max_i8",
   (Ops.MUL, dtypes.int16): "npu_mul_i16",
   (Ops.ADD, dtypes.int16): "npu_add_i16",
   (Ops.SUB, dtypes.int16): "npu_sub_i16",
+  (Ops.MAX, dtypes.int16): "npu_max_i16",
   (Ops.MUL, dtypes.bfloat16): "npu_mul_bf16",
   (Ops.ADD, dtypes.bfloat16): "npu_add_bf16",
   (Ops.SUB, dtypes.bfloat16): "npu_sub_bf16",
+  (Ops.MAX, dtypes.bfloat16): "npu_max_bf16",
 }
 # Scalar variants (one operand is a constant). fp32 vector-vector and fp32 mul-scalar excluded:
 # - vector-vector: ERDMA 32-bit limitation
@@ -193,14 +197,17 @@ _NPU_FN_SCALAR = {
   (Ops.MUL, dtypes.half):  "npu_mul_scalar",
   (Ops.ADD, dtypes.half):  "npu_add_scalar",
   (Ops.SUB, dtypes.half):  "npu_sub_scalar",
+  (Ops.MAX, dtypes.half):  "npu_max_scalar",
   (Ops.ADD, dtypes.float): "npu_add_scalar_f32",
   (Ops.SUB, dtypes.float): "npu_sub_scalar_f32",
   (Ops.MUL, dtypes.int16): "npu_mul_scalar_i16",
   (Ops.ADD, dtypes.int16): "npu_add_scalar_i16",
   (Ops.SUB, dtypes.int16): "npu_sub_scalar_i16",
+  (Ops.MAX, dtypes.int16): "npu_max_scalar_i16",
   (Ops.MUL, dtypes.bfloat16): "npu_mul_scalar_bf16",
   (Ops.ADD, dtypes.bfloat16): "npu_add_scalar_bf16",
   (Ops.SUB, dtypes.bfloat16): "npu_sub_scalar_bf16",
+  (Ops.MAX, dtypes.bfloat16): "npu_max_scalar_bf16",
 }
 _NPU_NEG = {dtypes.half: "npu_neg", dtypes.float: "npu_neg_f32", dtypes.int8: "npu_neg_i8", dtypes.int16: "npu_neg_i16",
             dtypes.bfloat16: "npu_neg_bf16"}
@@ -215,10 +222,10 @@ _const_bf16 = UPat(Ops.CONST, dtype=dtypes.bfloat16, name="c")
 # Pre-matcher: tag fp16/fp32/int8 ALU ops whose operands trace to PARAM loads.
 rknpu_pm = PatternMatcher([
   # fp16: vector OP vector
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.half, name="u", src=(_param_gep, _param_gep)),
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.half, name="u", src=(_param_gep, _param_gep)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[(u.op, u.dtype)])),
   # fp16: vector OP scalar  (note: `scalar - vector` is canonicalized by tinygrad to `v*(-1)+scalar`)
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.half, name="u", src=(_param_gep, _const_fp16)),
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.half, name="u", src=(_param_gep, _const_fp16)),
    lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[(u.op, u.dtype)])),
   # fp16: unary negate
   (UPat(Ops.NEG, dtype=dtypes.half, name="u", src=(_param_gep,)),
@@ -230,16 +237,16 @@ rknpu_pm = PatternMatcher([
   (UPat(Ops.NEG, dtype=dtypes.float, name="u", src=(_param_gep,)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
   # int8: vector OP vector
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.int8, name="u", src=(_param_gep, _param_gep)),
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.int8, name="u", src=(_param_gep, _param_gep)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[(u.op, u.dtype)])),
   # int8: unary negate
   (UPat(Ops.NEG, dtype=dtypes.int8, name="u", src=(_param_gep,)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
   # int16: vector OP vector
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.int16, name="u", src=(_param_gep, _param_gep)),
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.int16, name="u", src=(_param_gep, _param_gep)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[(u.op, u.dtype)])),
   # int16: vector OP scalar
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.int16, name="u", src=(_param_gep, _const_i16)),
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.int16, name="u", src=(_param_gep, _const_i16)),
    lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[(u.op, u.dtype)])),
   # int16: unary negate
   (UPat(Ops.NEG, dtype=dtypes.int16, name="u", src=(_param_gep,)),
@@ -250,10 +257,10 @@ rknpu_pm = PatternMatcher([
   # `npu_*_bf16(...)`. For looped kernels, tinygrad's emulation must take over instead, which it
   # does because we leave `is_dtype_supported(bfloat16, RKNPU)=False` — that triggers
   # `pm_dtype_decomps` to rewrite bf16 ops into ushort/bitshift form before this matcher fires.
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.bfloat16, name="u", src=(_param_gep, _param_gep)),
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.bfloat16, name="u", src=(_param_gep, _param_gep)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[(u.op, u.dtype)])),
   # bf16: vector OP scalar
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB), dtype=dtypes.bfloat16, name="u", src=(_param_gep, _const_bf16)),
+  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.bfloat16, name="u", src=(_param_gep, _const_bf16)),
    lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[(u.op, u.dtype)])),
   # bf16: unary negate
   (UPat(Ops.NEG, dtype=dtypes.bfloat16, name="u", src=(_param_gep,)),
@@ -273,6 +280,7 @@ class RkRenderer(ClangJITRenderer):
     (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"({ctx[x.src[0]]} + {ctx[x.src[1]]})" if x.arg in ("npu_add", "npu_add_scalar", "npu_add_f32", "npu_add_scalar_f32", "npu_add_i8", "npu_add_i16", "npu_add_scalar_i16", "npu_add_bf16", "npu_add_scalar_bf16") else None),
     (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"({ctx[x.src[0]]} - {ctx[x.src[1]]})" if x.arg in ("npu_sub", "npu_sub_scalar", "npu_sub_f32", "npu_sub_scalar_f32", "npu_sub_i8", "npu_sub_i16", "npu_sub_scalar_i16", "npu_sub_bf16", "npu_sub_scalar_bf16") else None),
     (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"(-{ctx[x.src[0]]})" if x.arg in ("npu_neg", "npu_neg_f32", "npu_neg_i8", "npu_neg_i16", "npu_neg_bf16") else None),
+    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"(({ctx[x.src[0]]}) > ({ctx[x.src[1]]}) ? ({ctx[x.src[0]]}) : ({ctx[x.src[1]]}))" if x.arg in ("npu_max", "npu_max_scalar", "npu_max_i8", "npu_max_i16", "npu_max_scalar_i16", "npu_max_bf16", "npu_max_scalar_bf16") else None),
   ]) + ClangJITRenderer.string_rewrite
 
   def __init__(self, target: Target):
@@ -376,6 +384,13 @@ class RkRenderer(ClangJITRenderer):
       'void npu_mul_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
       'void npu_add_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
       'void npu_sub_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
+      'void npu_max(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
+      'void npu_max_scalar(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __fp16 scalar, int elements);',
+      'void npu_max_i8(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
+      'void npu_max_i16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
+      'void npu_max_scalar_i16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, short scalar, int elements);',
+      'void npu_max_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
+      'void npu_max_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
     ]
     return defines
 
