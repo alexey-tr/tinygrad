@@ -292,17 +292,24 @@ class RkRenderer(ClangJITRenderer):
     # If any such node survived to render time, this is an NPU-accelerable kernel.
     _all_npu_fns = set(_NPU_FN.values()) | set(_NPU_FN_SCALAR.values()) | set(_NPU_NEG.values())
     npu_ops = [u for u in uops if u.op is Ops.CUSTOM and u.arg in _all_npu_fns]
-    has_loops = any(u.op is Ops.RANGE for u in uops)
     # Guards against the pre-matcher having matched only a sub-expression of a complex kernel.
     # The NPU dispatch only emits ONE function call and would silently drop unmatched compute.
     # (1) Check pointer count: scalar/unary expects 2 ptrs, vector-vector expects 3 (or fewer
     #     after in-place dedup). Extra ptrs mean unmatched inputs.
     # (2) Check that no other float/half ALU ops remain — those would be dropped.
+    # (3) All CUSTOMs must share one NPU fn name — otherwise we'd need >1 NPU call but emit only 1.
+    # (4) Exactly one STORE — fused multi-output kernels would lose the other outputs.
+    # The loop is irrelevant: tinygrad's UPCAST vectorizes element-wise kernels into N copies of the
+    # same per-lane CUSTOM (e.g. 4 lanes × 64 iters for upcast-4-256). All copies invoke the same
+    # NPU op on the same buffer pair, so we bypass the loop and emit a single call that processes
+    # all elements; the NPU iterates internally.
     _FLOAT_ALU = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.NEG, Ops.MAX, Ops.WHERE, Ops.RECIPROCAL, Ops.SQRT,
                   Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.TRUNC, Ops.CMPLT, Ops.CMPNE}
     extra_float_alu = any(u.op in _FLOAT_ALU and u.dtype.scalar() in (dtypes.float, dtypes.half) for u in uops)
-    if npu_ops and not has_loops and not extra_float_alu:
-      fn = npu_ops[0].arg
+    unique_npu_fns = {u.arg for u in npu_ops}
+    n_stores = sum(1 for u in uops if u.op is Ops.STORE)
+    if npu_ops and len(unique_npu_fns) == 1 and not extra_float_alu and n_stores == 1:
+      fn = next(iter(unique_npu_fns))
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
       is_scalar_or_unary = fn in _NPU_FN_SCALAR.values() or fn in _NPU_NEG.values()
