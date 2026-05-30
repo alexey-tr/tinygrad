@@ -3,7 +3,7 @@ import ctypes, functools, mmap, queue, threading, math
 from tinygrad.helpers import to_mv, from_mv, mv_address, cpu_profile, Target
 from tinygrad.device import BufferSpec
 from tinygrad.dtype import dtypes, PtrDType, DType
-from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat
+from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat, AxisType
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HCQArgsState, MMIOInterface
 from tinygrad.runtime.ops_cpu import CPUSignal, CPUWorker, CPUComputeQueue, CPUProgram, _in_worker_task
 from tinygrad.renderer.cstyle import ClangJITRenderer
@@ -117,6 +117,15 @@ for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8']:
                                  ctypes.c_void_p, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_uint64,
                                  ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+# void npu_sum_lastaxis_fp16(int fd, void* dst_va, u64 dst_dma, u64 dst_obj,
+#                            const void* src_va, u64 src_dma, int M, int K)
+# Sum over the contiguous last axis: dst[m] = sum_k src[m*K + k] (rowsum via matmul-by-ones).
+_lib.npu_sum_lastaxis_fp16.restype = None
+_lib.npu_sum_lastaxis_fp16.argtypes = [ctypes.c_int,
+                                       ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+                                       ctypes.c_void_p, ctypes.c_uint64,
+                                       ctypes.c_int, ctypes.c_int]
 
 # void mem_destroy(int fd, uint32_t handle, uint64_t obj_addr)
 _lib.mem_destroy.restype = None
@@ -240,6 +249,10 @@ _NPU_MATMUL = {
 # wrapper (it expects 2-byte bf16 inputs) and the NPU has no native fp32 matmul, so bf16 falls back
 # to CPU. (The DPU also can't emit bf16 output — no FP32->BF16 downcast bit — hence fp32 output.)
 
+# multiply-class ops that count as a matmul "product" (MULACC is fused multiply-add; absent in some
+# tinygrad versions, hence the guarded set).
+_MM_MUL_OPS = {Ops.MUL} | ({Ops.MULACC} if hasattr(Ops, 'MULACC') else set())
+
 def _try_match_matmul(uops):
   """Return (M, N, K, fn) if this uop list is a tinygrad-lowered matmul of a supported dtype
   AND the wrapper can actually handle the size, else None.
@@ -261,6 +274,18 @@ def _try_match_matmul(uops):
   import os, math
   dbg = os.environ.get('NPU_MATMUL_DEBUG') == '1'
   if not any(u.op in (Ops.REDUCE_AXIS, Ops.RANGE) for u in uops):
+    return None
+  # A real matmul contracts over K: it accumulates K products. The robust signature (verified by a
+  # probe across looped/unrolled matmuls vs every EW op) is a DEFINE_REG accumulator (looped K) OR
+  # >= 2 float/half MULTIPLIES (unrolled K => K product terms). A perfect-square-length elementwise
+  # op (out=p1=p2 => M=N=K=sqrt) factors to the SAME PARAM sizes but has no accumulation — without
+  # this guard it silently runs as a fake NxNxN matmul (e.g. (64,64) EW mul -> 4096=64^2 -> bogus
+  # 64x64x64 matmul, wrong results). NOTE: do NOT key on float ADD — `a - b` lowers to
+  # ADD(a, MUL(b,-1)), a single non-accumulating add that would wrongly pass; multiplies don't lie
+  # (mul/add/max rewrite to CUSTOM => 0 float MULs; sub has exactly 1).
+  n_fmul = sum(1 for u in uops if u.op in _MM_MUL_OPS and u.dtype.scalar() in (dtypes.float, dtypes.half))
+  if not (any(u.op is Ops.DEFINE_REG for u in uops) or n_fmul >= 2):
+    if dbg: print("[mm-match] reject: no K-accumulation (elementwise kernel?)")
     return None
   params = sorted([u for u in uops if u.op is Ops.PARAM], key=lambda u: u.arg)
   if len(params) != 3: return None
@@ -303,12 +328,93 @@ def _try_match_matmul(uops):
   if dbg: print(f"[mm-match] M={M} K={K} N={N} (out={out_sz} p1={p1_sz} p2={p2_sz})")
   return (M, N, K, fn)
 
+def _try_match_reduce(uops):
+  """Return (M, K) if this kernel is a pure SUM-reduce of an fp16 tensor over its contiguous
+  last axis/axes — routable to npu_sum_lastaxis_fp16 (rowsum via matmul-by-ones, validated in
+  reduce_proto.py / reduce_wrapper_test.py) — else None.
+
+  The hazard is silent corruption: (M,K).sum(axis=-1) and (K,M).sum(axis=0) both factor the
+  input as M*K, but only the last-axis case lays each output's K summands out contiguously.
+  We discriminate on the LINEAR COEFFICIENT of each range var in the input index (recovered by
+  symbolic substitution, so it is invariant under UPCAST/UNROLL — tinygrad vectorizes the reduce,
+  e.g. K=64 becomes 16 iters x stride-4 of a 4-wide load, so a naive 'stride==1' test fails).
+
+  For SUM the within-block order is irrelevant; correctness needs only that each output reduces
+  its own contiguous K-block. We verify:
+    - 2 fp16 PARAMs (0=out, 1=in), out_sz | in_sz, K = in_sz//out_sz >= 8 (>= one fp16 pixel);
+    - no other float/half ALU (a fused softmax/layernorm reduce -> fall back to CPU);
+    - LOOP extents multiply to M (loops enumerate exactly the outputs);
+    - the access perfectly tiles [0, in_sz) (bijection => every element summed once), with the
+      derived innermost vector width V = in_sz/(loop_ext*red_ext) and red_ext*V == K;
+    - loops are the OUTER, block-aligned dims (input coeff >= K) and reduces the INNER (coeff < K),
+      so output m reduces exactly [m*K, (m+1)*K)."""
+  reds  = [u for u in uops if u.op is Ops.RANGE and len(u.arg) > 1 and u.arg[1] is AxisType.REDUCE]
+  loops = [u for u in uops if u.op is Ops.RANGE and len(u.arg) > 1 and u.arg[1] is AxisType.LOOP]
+  if not reds: return None
+  params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u: u.arg)
+  if len(params) != 2 or params[0].arg != 0 or params[1].arg != 1: return None
+  out_p, in_p = params[0], params[1]
+  if out_p.dtype.base is not dtypes.half or in_p.dtype.base is not dtypes.half: return None
+  out_sz, in_sz = out_p.dtype.size, in_p.dtype.size
+  if out_sz < 1 or in_sz % out_sz != 0: return None
+  M, K = out_sz, in_sz // out_sz
+  if K < 8: return None
+
+  # pure reduce: the accumulating ADD is fine; any other float/half ALU => fused => fall back
+  _EXTRA = {Ops.MUL, Ops.SUB, Ops.NEG, Ops.MAX, Ops.WHERE, Ops.RECIPROCAL, Ops.SQRT,
+            Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CMPLT, Ops.CMPNE}
+  if any(u.op in _EXTRA and u.dtype.scalar() in (dtypes.float, dtypes.half) for u in uops): return None
+
+  in_off = next((u.src[1] for u in uops if u.op is Ops.INDEX and u.src[0] is in_p), None)
+  if in_off is None: return None
+  off_ranges = [u for u in in_off.toposort() if u.op is Ops.RANGE]
+  def extent(r): return r.src[0].arg if r.src and r.src[0].op is Ops.CONST else None
+  def coeff(var):  # linear coeff of var in in_off (other ranges -> 0); None if non-linear
+    a = in_off.substitute({r: r.const_like(0) for r in off_ranges}).simplify()
+    b = in_off.substitute({r: r.const_like(1 if r is var else 0) for r in off_ranges}).simplify()
+    return (b.arg - a.arg) if (a.op is Ops.CONST and b.op is Ops.CONST) else None
+
+  dims = []  # (coeff, extent, is_reduce) for every range that indexes the input
+  for r in loops + reds:
+    c, e = coeff(r), extent(r)
+    if c is None or e is None or e < 1: return None
+    dims.append((c, e, r in reds))
+  loop_ext = 1
+  for r in loops:
+    loop_ext *= extent(r)
+  red_ext = 1
+  for r in reds:
+    red_ext *= extent(r)
+  if loop_ext != M: return None
+  if loop_ext * red_ext == 0 or in_sz % (loop_ext * red_ext) != 0: return None
+  V = in_sz // (loop_ext * red_ext)                  # innermost contiguous vector lanes
+  if red_ext * V != K: return None                   # reduce (+vector) covers exactly the K-block
+
+  # perfect contiguous tiling => bijection onto [0, in_sz): vector fills [0,V), each range stacks
+  stride = V
+  for c, e, _is_red in sorted(dims, key=lambda d: d[0]):
+    if c != stride: return None
+    stride *= e
+  if stride != in_sz: return None
+
+  # block alignment: loops outer (>=K), reduces inner (<K) => each output gets a clean K-block
+  if any(c < K for c, _e, is_red in dims if not is_red): return None
+  if any(c >= K for c, _e, is_red in dims if is_red): return None
+  return (M, K)
+
 # Post-devectorization shape: GEP(LOAD(CAST(INDEX(PARAM, ...))))
 _param_gep = UPat(Ops.GEP, src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),))
 _const_fp16 = UPat(Ops.CONST, dtype=dtypes.half, name="c")
 _const_fp32 = UPat(Ops.CONST, dtype=dtypes.float, name="c")
 _const_i16  = UPat(Ops.CONST, dtype=dtypes.int16, name="c")
 _const_bf16 = UPat(Ops.CONST, dtype=dtypes.bfloat16, name="c")
+
+def _is_mul_neg1(m):
+  """True if m is the CUSTOM npu_mul_scalar(x, -1.0) that tinygrad emits for the `-b` in `a - b`.
+  (tinygrad lowers SUB to ADD(a, b*(-1)) before this pre-matcher runs, and the inner b*(-1) is
+  itself rewritten to npu_mul_scalar by the vector-OP-scalar rule above.)"""
+  return (m.op is Ops.CUSTOM and m.arg in ("npu_mul_scalar", "npu_mul_scalar_bf16", "npu_mul_scalar_i16")
+          and len(m.src) == 2 and m.src[1].op is Ops.CONST and float(m.src[1].arg) == -1.0)
 
 # Pre-matcher: tag fp16/fp32/int8 ALU ops whose operands trace to PARAM loads.
 rknpu_pm = PatternMatcher([
@@ -321,6 +427,12 @@ rknpu_pm = PatternMatcher([
   # fp16: unary negate
   (UPat(Ops.NEG, dtype=dtypes.half, name="u", src=(_param_gep,)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
+  # fp16: recover vector-vector subtract. `a - b` arrives as ADD(a, npu_mul_scalar(b, -1)) — see
+  # _is_mul_neg1 — so fold it back into a single npu_sub(a, b). Both ADD operand orders (commutative).
+  (UPat(Ops.ADD, dtype=dtypes.half, name="u", src=(_param_gep, UPat(Ops.CUSTOM, name="m"))),
+   lambda u, m: UOp(Ops.CUSTOM, u.dtype, (u.src[0], m.src[0]), _NPU_FN[(Ops.SUB, dtypes.half)]) if _is_mul_neg1(m) else None),
+  (UPat(Ops.ADD, dtype=dtypes.half, name="u", src=(UPat(Ops.CUSTOM, name="m"), _param_gep)),
+   lambda u, m: UOp(Ops.CUSTOM, u.dtype, (u.src[1], m.src[0]), _NPU_FN[(Ops.SUB, dtypes.half)]) if _is_mul_neg1(m) else None),
   # fp32: ADD/SUB scalar only (MUL scalar hangs; vector-vector broken due to ERDMA 32-bit limit)
   (UPat((Ops.ADD, Ops.SUB), dtype=dtypes.float, name="u", src=(_param_gep, _const_fp32)),
    lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[(u.op, u.dtype)])),
@@ -398,6 +510,22 @@ class RkRenderer(ClangJITRenderer):
                 f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
                 f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
                 f"{M}, {K}, {N});"]
+        return self.render_kernel(name, body, bufs, uops)
+
+    # *** Reduce fast path ***
+    # A pure SUM-reduce over the contiguous last axis (M,K)->(M,) is a matmul-by-ones.
+    # PARAMs emit to bufs in arg order: 0=output, 1=input (same convention as matmul).
+    rd = _try_match_reduce(uops)
+    if rd is not None:
+      M, K = rd
+      name, _kernel, bufs = self._render(uops)
+      ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
+      if len(ptr_indices) == 2:
+        i_out, i_in = ptr_indices[0], ptr_indices[1]
+        body = [f"  npu_sum_lastaxis_fp16(npu_fd, "
+                f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
+                f"(const void*){bufs[i_in][0]}, dma_{i_in}, "
+                f"{M}, {K});"]
         return self.render_kernel(name, body, bufs, uops)
 
     # rknpu_pm rewrites eligible fp16 ALU ops to CUSTOM nodes tagged with the NPU fn name.
@@ -513,6 +641,7 @@ class RkRenderer(ClangJITRenderer):
       'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
       'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
       'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
+      'void npu_sum_lastaxis_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *src_va, unsigned long long src_dma, int M, int K);',
     ]
     return defines
 
