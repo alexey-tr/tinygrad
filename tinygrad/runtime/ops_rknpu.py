@@ -106,6 +106,18 @@ for _fn in ['npu_mul_scalar_bf16', 'npu_add_scalar_bf16', 'npu_sub_scalar_bf16',
 _lib.npu_neg_bf16.restype = None
 _lib.npu_neg_bf16.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
+# matmul: void npu_matmul_<dtype>(int fd, void* dst_va, u64 dst_dma, u64 dst_obj,
+#                                  const void* a_va, u64 a_dma,
+#                                  const void* b_va, u64 b_dma,
+#                                  int M, int K, int N)
+for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8']:
+  getattr(_lib, _fn).restype = None
+  getattr(_lib, _fn).argtypes = [ctypes.c_int,
+                                 ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+                                 ctypes.c_void_p, ctypes.c_uint64,
+                                 ctypes.c_void_p, ctypes.c_uint64,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
 # void mem_destroy(int fd, uint32_t handle, uint64_t obj_addr)
 _lib.mem_destroy.restype = None
 _lib.mem_destroy.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64]
@@ -212,6 +224,85 @@ _NPU_FN_SCALAR = {
 _NPU_NEG = {dtypes.half: "npu_neg", dtypes.float: "npu_neg_f32", dtypes.int8: "npu_neg_i8", dtypes.int16: "npu_neg_i16",
             dtypes.bfloat16: "npu_neg_bf16"}
 
+# Matmul auto-dispatch, keyed by (input dtype, output dtype). The int8 wrapper accumulates in a
+# wider type than its inputs (int8 x int8 -> int32), so output dtype differs from inputs — hence
+# matching on the pair, not just the output. tinygrad produces an int32-output kernel for int8
+# inputs when the matmul uses acc_dtype=int32 (the full-accumulator path the wrapper implements;
+# a plain int8->int8 matmul truncates differently and must NOT map here).
+_NPU_MATMUL = {
+  (dtypes.half, dtypes.half):  "npu_matmul_fp16",
+  (dtypes.int8, dtypes.int32): "npu_matmul_int8",
+}
+# bf16 matmul (npu_matmul_bf16: bf16 in -> fp32 out) is implemented + validated in the runtime
+# and callable directly via ctypes, but is NOT auto-dispatched: tinygrad lowers a bf16 matmul by
+# casting the inputs to the fp32 accumulation dtype, so the matmul kernel's input PARAMs arrive as
+# fp32 (or ushort via bitcast) — never bfloat16. We can't route an fp32-PARAM matmul to the bf16
+# wrapper (it expects 2-byte bf16 inputs) and the NPU has no native fp32 matmul, so bf16 falls back
+# to CPU. (The DPU also can't emit bf16 output — no FP32->BF16 downcast bit — hence fp32 output.)
+
+def _try_match_matmul(uops):
+  """Return (M, N, K, fn) if this uop list is a tinygrad-lowered matmul of a supported dtype
+  AND the wrapper can actually handle the size, else None.
+
+  Detection is size-based, not kernel-name-based, because tinygrad's loop-opt passes (UPCAST,
+  UNROLL, etc.) rename `r_M_N_K` into multi-axis forms like `r_50_4_2_4_4_16_4`. The PARAM
+  pointer sizes are invariant under those passes, so we recover (M, N, K) from them:
+    out_sz = M*N,  p1_sz = M*K,  p2_sz = K*N   (PARAM-arg order: 0=output, 1=A, 2=B)
+    => K*K = p1_sz * p2_sz / out_sz
+    => M = p1_sz / K,  N = p2_sz / K
+  A REDUCE_AXIS or RANGE somewhere in the AST is required so we don't latch onto a pure
+  element-wise kernel that happens to have matching PARAM sizes (e.g. M=K=N=1).
+
+  Final check: the wrapper's pick_tile algorithm has a CBUF feasibility envelope. If the
+  matcher accepts a size the wrapper then rejects ("cannot tile"), the wrapper returns
+  without writing dst — silently corrupting downstream consumers (the kernel runs but its
+  output is the buffer's prior contents). So we MUST mirror the wrapper's tile-feasibility
+  check here and fall back to CPU when it would fail."""
+  import os, math
+  dbg = os.environ.get('NPU_MATMUL_DEBUG') == '1'
+  if not any(u.op in (Ops.REDUCE_AXIS, Ops.RANGE) for u in uops):
+    return None
+  params = sorted([u for u in uops if u.op is Ops.PARAM], key=lambda u: u.arg)
+  if len(params) != 3: return None
+  if params[0].arg != 0 or params[1].arg != 1 or params[2].arg != 2: return None
+  # PARAM dtypes are PtrDType wrappers; .base unwraps to the scalar element type.
+  out_dt = params[0].dtype.base
+  in_dt  = params[1].dtype.base
+  if params[2].dtype.base != in_dt: return None    # A and B must share a dtype
+  fn = _NPU_MATMUL.get((in_dt, out_dt))
+  if fn is None: return None
+  out_sz, p1_sz, p2_sz = params[0].dtype.size, params[1].dtype.size, params[2].dtype.size
+  if out_sz < 1 or p1_sz < 1 or p2_sz < 1: return None
+  k_sq_num = p1_sz * p2_sz
+  if k_sq_num % out_sz != 0: return None
+  k_sq = k_sq_num // out_sz
+  K = math.isqrt(k_sq)
+  if K * K != k_sq or K < 1: return None
+  if p1_sz % K != 0 or p2_sz % K != 0: return None
+  M = p1_sz // K
+  N = p2_sz // K
+  if M * N != out_sz or M < 1 or N < 1: return None
+
+  # Mirror pick_tile feasibility: K_pad weight column must fit one CBUF bank, AND there must
+  # be enough remaining banks for at least one Mt slab of input data. The wrapper enforces
+  # Mt>=4 (or 1 when M==1) and Nt>=N_align (16 fp16/bf16, 32 int8). Element width follows the
+  # INPUT dtype (int8 inputs are 1 byte even though the output is int32).
+  elem_bytes = 2 if in_dt in (dtypes.half, dtypes.bfloat16) else 1
+  N_align = 16 if elem_bytes == 2 else 32
+  K_pad = ((K + 31) // 32) * 32
+  CBUF_BANK = 32768
+  CBUF_BANKS_USABLE = 11   # 12 total - 1 reserved
+  if K_pad * elem_bytes > CBUF_BANK: return None
+  Nt_min = N_align
+  weight_banks_min = (K_pad * Nt_min * elem_bytes + CBUF_BANK - 1) // CBUF_BANK
+  data_banks_avail = CBUF_BANKS_USABLE - weight_banks_min
+  Mt_floor = 1 if M == 1 else 4
+  if data_banks_avail < 1: return None
+  if Mt_floor * K_pad * elem_bytes > data_banks_avail * CBUF_BANK: return None
+
+  if dbg: print(f"[mm-match] M={M} K={K} N={N} (out={out_sz} p1={p1_sz} p2={p2_sz})")
+  return (M, N, K, fn)
+
 # Post-devectorization shape: GEP(LOAD(CAST(INDEX(PARAM, ...))))
 _param_gep = UPat(Ops.GEP, src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),))
 _const_fp16 = UPat(Ops.CONST, dtype=dtypes.half, name="c")
@@ -288,6 +379,27 @@ class RkRenderer(ClangJITRenderer):
     self.compiler = RkCompiler()
 
   def render(self, uops: list[UOp]) -> str:
+    # *** Matmul fast path ***
+    # tinygrad lowers `a @ b` to a reduce-loop kernel named "r_M_N_K" (with ANSI color codes).
+    # When the AST contains: 3 PARAMs (output, A, B) with ptr sizes M*N / M*K / K*N, one
+    # STORE, a REDUCE_AXIS or RANGE loop, and the output dtype is in _NPU_MATMUL, redirect
+    # the whole kernel to a single npu_matmul_<dtype>() call. Otherwise fall through to the
+    # element-wise path / CPU.
+    mm = _try_match_matmul(uops)
+    if mm is not None:
+      M, N, K, fn = mm
+      name, _kernel, bufs = self._render(uops)
+      ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
+      # PARAMs are emitted to bufs in arg order: 0=output, 1=A, 2=B (verified via probe).
+      if len(ptr_indices) == 3:
+        i_out, i_A, i_B = ptr_indices[0], ptr_indices[1], ptr_indices[2]
+        body = [f"  {fn}(npu_fd, "
+                f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
+                f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
+                f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
+                f"{M}, {K}, {N});"]
+        return self.render_kernel(name, body, bufs, uops)
+
     # rknpu_pm rewrites eligible fp16 ALU ops to CUSTOM nodes tagged with the NPU fn name.
     # If any such node survived to render time, this is an NPU-accelerable kernel.
     _all_npu_fns = set(_NPU_FN.values()) | set(_NPU_FN_SCALAR.values()) | set(_NPU_NEG.values())
@@ -398,6 +510,9 @@ class RkRenderer(ClangJITRenderer):
       'void npu_max_scalar_i16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, short scalar, int elements);',
       'void npu_max_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_max_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
+      'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
+      'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
+      'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
     ]
     return defines
 
