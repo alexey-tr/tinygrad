@@ -1,5 +1,8 @@
 from __future__ import annotations
-import ctypes, functools, mmap, queue, threading, math
+import ctypes, functools, mmap, queue, threading, math, re
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+def _strip_ansi(s: str) -> str: return _ANSI_RE.sub('', s)  # kernel display names are ANSI-colored; match on plain
 from tinygrad.helpers import to_mv, from_mv, mv_address, cpu_profile, Target
 from tinygrad.device import BufferSpec
 from tinygrad.dtype import dtypes, PtrDType, DType
@@ -152,6 +155,21 @@ def _mem_destroy(fd: int, handle: int, obj_addr: int):
   _lib.mem_destroy(fd, handle, obj_addr)
 
 
+# DRM_IOCTL_RKNPU_MEM_SYNC = DRM_IOWR(DRM_COMMAND_BASE+0x05, struct rknpu_mem_sync[32 bytes])
+_RKNPU_MEM_SYNC = 0xC0206445
+_MEM_SYNC_TO_DEVICE   = 1   # flush CPU cache -> DRAM (before NPU reads CPU-written input)
+_MEM_SYNC_FROM_DEVICE = 2   # invalidate CPU cache (before CPU reads NPU-written output)
+class _rknpu_mem_sync(ctypes.Structure):
+  _fields_ = [("flags", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
+              ("obj_addr", ctypes.c_uint64), ("offset", ctypes.c_uint64), ("size", ctypes.c_uint64)]
+
+def _mem_sync(fd: int, obj_addr: int, size: int, flags: int):
+  """Cache maintenance for a CACHEABLE DMA buffer. No-op-safe: only call on cacheable allocs
+  (returns EINVAL on write-combine). Required because the NPU DMAs around the CPU cache."""
+  import fcntl
+  fcntl.ioctl(fd, _RKNPU_MEM_SYNC, _rknpu_mem_sync(flags=flags, obj_addr=obj_addr, offset=0, size=size))
+
+
 # *** RKNPU Allocator ***
 
 class RKNPUAllocator(HCQAllocator):
@@ -161,8 +179,11 @@ class RKNPUAllocator(HCQAllocator):
   def _alloc(self, size: int, options: BufferSpec) -> HCQBuffer:
     # rknpu driver requires page-aligned size for mmap when using NON_CONTIGUOUS
     aligned_size = (size + 4095) & ~4095
-    # RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_IOMMU | RKNPU_MEM_WRITE_COMBINE = 1 | 16 | 4 = 21
-    va, dma_addr, obj_addr, handle = _mem_allocate(self.dev.fd, aligned_size, flags=21)
+    # RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE | RKNPU_MEM_IOMMU = 1 | 2 | 16 = 19.
+    # CACHEABLE (not WRITE_COMBINE): CPU reads from cached memory are ~9x faster (12 vs 1.4 GB/s),
+    # which dominates copy-out. Cost: the NPU DMAs around the CPU cache, so _copyin must flush
+    # (TO_DEVICE) and _copyout/_as_buffer must invalidate (FROM_DEVICE) — see _mem_sync.
+    va, dma_addr, obj_addr, handle = _mem_allocate(self.dev.fd, aligned_size, flags=19)
     view = MMIOInterface(va, size, fmt='B')
     return HCQBuffer(va_addr=va, size=size, meta=(handle, obj_addr, dma_addr, aligned_size), view=view, owner=self.dev)
 
@@ -174,17 +195,21 @@ class RKNPUAllocator(HCQAllocator):
 
   def _as_buffer(self, src: HCQBuffer) -> memoryview:
     self.dev.synchronize()
+    _mem_sync(self.dev.fd, src.meta[1], src.meta[3], _MEM_SYNC_FROM_DEVICE)  # invalidate: NPU wrote DRAM
     return to_mv(src.va_addr, src.size)
 
   # Override _copyin/_copyout to use direct memmove. The base HCQAllocator would use hw_copy_queue_t
   # (RKNPUCopyQueue), which runs npu_add_scalar and treats all data as fp16 — corrupting non-fp16 buffers.
-  # RKNPU memory is CPU-accessible (unified address space), so memmove works directly.
+  # RKNPU memory is CPU-accessible (unified address space), so memmove works directly. Buffers are
+  # CACHEABLE (fast CPU reads), so cache maintenance brackets the CPU<->NPU handoff.
   def _copyin(self, dest: HCQBuffer, src: memoryview):
     self.dev.synchronize()
     with cpu_profile(f'TINY -> {self.dev.device}', f"{self.dev.device}:COPY"): ctypes.memmove(int(dest.va_addr), from_mv(src), len(src))
+    _mem_sync(self.dev.fd, dest.meta[1], dest.meta[3], _MEM_SYNC_TO_DEVICE)  # flush: NPU reads DRAM
 
   def _copyout(self, dest: memoryview, src: HCQBuffer):
     self.dev.synchronize()
+    _mem_sync(self.dev.fd, src.meta[1], src.meta[3], _MEM_SYNC_FROM_DEVICE)  # invalidate: NPU wrote DRAM
     with cpu_profile(f'{self.dev.device} -> TINY', f"{self.dev.device}:COPY"): ctypes.memmove(from_mv(dest), int(src.va_addr), len(dest))
 
   def _map(self, buf: HCQBuffer): return None  # unified address space, no extra mapping needed
@@ -489,6 +514,12 @@ class RkRenderer(ClangJITRenderer):
   def __init__(self, target: Target):
     super().__init__(target)
     self.compiler = RkCompiler()
+    # Names of kernels rendered via an NPU fast path. These call a single libhack
+    # npu_*() over the WHOLE buffer, so they must execute exactly once — NOT be
+    # data-parallel-split across global_size threads (which would re-submit the full
+    # op N times and serialize them on the NPU's per-core FIFO). RKNPUComputeQueue.exec
+    # forces threads=1 for these. See _try_match_* / the EW fast path below.
+    self._npu_kernel_names: set[str] = set()
 
   def render(self, uops: list[UOp]) -> str:
     # *** Matmul fast path ***
@@ -510,6 +541,7 @@ class RkRenderer(ClangJITRenderer):
                 f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
                 f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
                 f"{M}, {K}, {N});"]
+        self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
     # *** Reduce fast path ***
@@ -526,6 +558,7 @@ class RkRenderer(ClangJITRenderer):
                 f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
                 f"(const void*){bufs[i_in][0]}, dma_{i_in}, "
                 f"{M}, {K});"]
+        self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
     # rknpu_pm rewrites eligible fp16 ALU ops to CUSTOM nodes tagged with the NPU fn name.
@@ -595,6 +628,7 @@ class RkRenderer(ClangJITRenderer):
         body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[1]}, dma_{ptr_indices[2]}, {n});")
         for i in ptr_indices[3:]:
           body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[0]}, dma_{i}, {n});")
+      self._npu_kernel_names.add(_strip_ansi(name))
       return self.render_kernel(name, body, bufs, uops)
 
     return super().render(uops)
@@ -708,8 +742,14 @@ class RKNPUComputeQueue(CPUComputeQueue):
         obj_addr, dma_addr = 0, 0
       dma_args.extend([dma_addr, obj_addr])
     dev_fd = prg.dev.fd
+    # NPU fast-path kernels emit a single npu_*() over the whole buffer and must run ONCE.
+    # tinygrad may split an elementwise/matmul kernel into global_size>1 data-parallel threads;
+    # for an NPU kernel that re-submits the FULL op once per thread and serializes them on the
+    # NPU FIFO (≈N× slowdown + N concurrent submits on one fd). Force threads=1 for NPU kernels.
+    is_npu = _strip_ansi(prg.name) in getattr(prg.dev.renderer, "_npu_kernel_names", ())
+    threads = 1 if is_npu else (global_size or (1,))[0]
     return self.cmd(self._rknpu_exec, prg, dev_fd, len(args_state.bufs), len(dma_args),
-                    *[x.va_addr for x in args_state.bufs], *dma_args, *args_state.vals, threads=(global_size or (1,))[0])
+                    *[x.va_addr for x in args_state.bufs], *dma_args, *args_state.vals, threads=threads)
 
 # Minimum byte size to use NPU for copy; below this threshold, memmove is faster
 _COPY_NPU_MIN_BYTES = 4096
