@@ -113,7 +113,7 @@ _lib.npu_neg_bf16.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ct
 #                                  const void* a_va, u64 a_dma,
 #                                  const void* b_va, u64 b_dma,
 #                                  int M, int K, int N)
-for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8']:
+for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8', 'npu_matmul_fp16_bt']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int,
                                  ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
@@ -363,11 +363,12 @@ def _try_match_matmul(uops):
   # PARAM2 (B) LAYOUT CHECK. npu_matmul_* tiles its 2nd operand assuming row-major [K,N] (it
   # transposes-while-tiling). A genuinely-transposed [N,K]-contiguous operand (e.g.
   # B.T.contiguous().realize(), or any materialized transposed weight) has identical byte size K*N,
-  # so the size-based recovery above can't tell it from [K,N] and would silently mis-tile it. Verify
-  # the stride structure: in [K,N] the contraction k is the strided dim and the output dim n is
-  # contiguous-ish, i.e. max(loop coeff) <= min(reduce coeff); [N,K] inverts that. (Calibrated on the
-  # matmul test suite: [K,N] gives loop in {1,4}, reduce in {16,17,64,128,16384,32768} or empty;
-  # [N,K] gives loop={K}, reduce={1}.) Reject -> CPU when it's not [K,N]; can't tell -> reject.
+  # so the size-based recovery above can't tell it from [K,N]. Inspect the stride structure: in [K,N]
+  # the contraction k is the strided dim and the output dim n is contiguous-ish (max loop coeff <= min
+  # reduce coeff); [N,K] inverts that. (Calibrated on the matmul suite: [K,N] gives loop in {1,4},
+  # reduce in {16,17,64,128,16384,32768} or empty; [N,K] gives loop={K}, reduce={1}.) [K,N] -> normal;
+  # [N,K] fp16 -> the pre-transposed fast path npu_matmul_fp16_bt (contiguous weight pack, no
+  # transpose); [N,K] for bf16/int8 (no _bt variant) or can't-tell -> reject (-> CPU).
   if N > 1:
     Rc, Lc, p2_nonaffine = set(), set(), False
     for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is params[2]]:
@@ -378,14 +379,20 @@ def _try_match_matmul(uops):
         b = off.substitute({x: x.const_like(1 if x is r else 0) for x in rs}).simplify()
         if b.op is Ops.CONST and (b.arg - base.arg):
           (Rc if (len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE) else Lc).add(b.arg - base.arg)
-    if p2_nonaffine:               layout_ok = False                  # can't verify -> reject (safe)
-    elif Rc and Lc:                layout_ok = max(Lc) <= min(Rc)     # k strided, n contiguous-ish
-    elif Rc:                       layout_ok = min(Rc) > 1            # n unrolled (stride 1), k strided
-    elif Lc:                       layout_ok = (min(Lc) == 1)         # k unrolled (strided), n contiguous
-    else:                          layout_ok = True                  # both unrolled / degenerate
-    if not layout_ok:
-      if dbg: print(f"[mm-match] reject: PARAM2 not [K,N] (reduce={sorted(Rc)} loop={sorted(Lc)})")
+    if   p2_nonaffine: layout = 'unknown'
+    elif Rc and Lc:    layout = 'kn' if max(Lc) <= min(Rc) else ('nk' if max(Rc) <= min(Lc) else 'unknown')
+    elif Rc:           layout = 'kn' if min(Rc) > 1 else 'nk'
+    elif Lc:           layout = 'kn' if min(Lc) == 1 else 'nk'
+    else:              layout = 'kn'                                   # both unrolled / degenerate
+    if layout == 'unknown':
+      if dbg: print(f"[mm-match] reject: PARAM2 layout unclear (reduce={sorted(Rc)} loop={sorted(Lc)})")
       return None
+    if layout == 'nk':
+      if fn != 'npu_matmul_fp16':
+        if dbg: print(f"[mm-match] reject: transposed [N,K] weight, no _bt variant for {fn}")
+        return None
+      fn = 'npu_matmul_fp16_bt'                                       # pre-transposed weight fast path
+      if dbg: print("[mm-match] PARAM2 is [N,K] -> npu_matmul_fp16_bt")
 
   if dbg: print(f"[mm-match] M={M} K={K} N={N} (out={out_sz} p1={p1_sz} p2={p2_sz})")
   return (M, N, K, fn)
@@ -868,6 +875,7 @@ class RkRenderer(ClangJITRenderer):
       'void npu_max_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_max_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
       'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
+      'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
       'void npu_conv_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *feat_va, unsigned long long feat_dma, const void *weight_va, unsigned long long weight_dma, int N, int Cin, int IH, int IW, int Cout, int KH, int KW, int sh, int sw, int fp16_out);',
       'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
       'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
