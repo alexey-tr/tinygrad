@@ -121,6 +121,16 @@ for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8']:
                                  ctypes.c_void_p, ctypes.c_uint64,
                                  ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
+# void npu_conv_fp16(int fd, void* dst_va, u64 dst_dma, u64 dst_obj, const void* feat_va, u64 feat_dma,
+#                    const void* weight_va, u64 weight_dma, int N,Cin,IH,IW,Cout,KH,KW,sh,sw,fp16_out)
+_lib.npu_conv_fp16.restype = None
+_lib.npu_conv_fp16.argtypes = [ctypes.c_int,
+                               ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+                               ctypes.c_void_p, ctypes.c_uint64,
+                               ctypes.c_void_p, ctypes.c_uint64,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
 # void npu_sum_lastaxis_fp16(int fd, void* dst_va, u64 dst_dma, u64 dst_obj,
 #                            const void* src_va, u64 src_dma, int M, int K)
 # Sum over the contiguous last axis: dst[m] = sum_k src[m*K + k] (rowsum via matmul-by-ones).
@@ -539,6 +549,27 @@ def _try_match_conv(uops):
                       OH=OH, OW=OW, sh=sh, sw=sw)
   return None
 
+def _conv_signature(uops):
+  """True if the kernel is conv-shaped — used to stop a conv that _try_match_conv couldn't parse from
+  being mis-grabbed by _try_match_matmul (which size-factors it into a bogus matmul -> silent garbage).
+  Signal: the INPUT (param1) has a REDUCE range with coefficient > 16 (= the channel stride IH*IW). A
+  matmul's contraction is contiguous/vectorized in its input (coeff = 1 or the vector width, <= 16), so
+  it never trips this; a spatial conv's cin stride IH*IW is large. (The weight param can't be used —
+  output-channel UPCAST makes it non-affine.) Cost: misses tiny-spatial (IH*IW<=16) convs."""
+  params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u: u.arg)
+  if len(params) != 3 or [p.arg for p in params] != [0, 1, 2]: return False
+  def is_reduce(r): return len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE
+  in_p = params[1]
+  for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is in_p]:
+    off = ix.src[1]; rs = [u for u in off.toposort() if u.op is Ops.RANGE]
+    base = off.substitute({x: x.const_like(0) for x in rs}).simplify()
+    if base.op is not Ops.CONST: continue
+    for r in rs:
+      if not is_reduce(r): continue
+      b = off.substitute({x: x.const_like(1 if x is r else 0) for x in rs}).simplify()
+      if b.op is Ops.CONST and (b.arg - base.arg) > 16: return True
+  return False
+
 # Post-devectorization shape: GEP(LOAD(CAST(INDEX(PARAM, ...))))
 _param_gep = UPat(Ops.GEP, src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),))
 _const_fp16 = UPat(Ops.CONST, dtype=dtypes.half, name="c")
@@ -634,6 +665,31 @@ class RkRenderer(ClangJITRenderer):
     self._npu_kernel_names: set[str] = set()
 
   def render(self, uops: list[UOp]) -> str:
+    # *** Conv fast path ***
+    # tinygrad lowers conv2d to (pool(x) * weight).sum(cin,kh,kw); _try_match_conv recovers NCHW
+    # geometry from the input PARAM's windowed index (None for 1x1 -> matmul, and for
+    # dilation/padding/groups/non-fp16). PARAMs emit in arg order: 0=output, 1=input, 2=weight.
+    # Route the whole kernel to one npu_conv_fp16() (fp16 output, matching tinygrad's fp16 conv).
+    cv = _try_match_conv(uops)
+    if cv is not None:
+      name, _kernel, bufs = self._render(uops)
+      ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
+      if len(ptr_indices) == 3:
+        i_out, i_in, i_w = ptr_indices[0], ptr_indices[1], ptr_indices[2]
+        g = cv
+        body = [f"  npu_conv_fp16(npu_fd, "
+                f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
+                f"(const void*){bufs[i_in][0]}, dma_{i_in}, "
+                f"(const void*){bufs[i_w][0]}, dma_{i_w}, "
+                f"{g['N']}, {g['Cin']}, {g['IH']}, {g['IW']}, {g['Cout']}, "
+                f"{g['KH']}, {g['KW']}, {g['sh']}, {g['sw']}, 1);"]
+        self._npu_kernel_names.add(_strip_ansi(name))
+        return self.render_kernel(name, body, bufs, uops)
+    # Conv-shaped but unparsed (heavy UPCAST): fall back to CPU rather than let the matmul matcher
+    # size-factor it into a bogus matmul (silent wrong results). Correctness over coverage.
+    if _conv_signature(uops):
+      return super().render(uops)
+
     # *** Matmul fast path ***
     # tinygrad lowers `a @ b` to a reduce-loop kernel named "r_M_N_K" (with ANSI color codes).
     # When the AST contains: 3 PARAMs (output, A, B) with ptr sizes M*N / M*K / K*N, one
@@ -785,6 +841,7 @@ class RkRenderer(ClangJITRenderer):
       'void npu_max_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_max_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
       'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
+      'void npu_conv_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *feat_va, unsigned long long feat_dma, const void *weight_va, unsigned long long weight_dma, int N, int Cin, int IH, int IW, int Cout, int KH, int KW, int sh, int sw, int fp16_out);',
       'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
       'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
       'void npu_sum_lastaxis_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *src_va, unsigned long long src_dma, int M, int K);',
