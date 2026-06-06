@@ -360,6 +360,33 @@ def _try_match_matmul(uops):
   if data_banks_avail < 1: return None
   if Mt_floor * K_pad * elem_bytes > data_banks_avail * CBUF_BANK: return None
 
+  # PARAM2 (B) LAYOUT CHECK. npu_matmul_* tiles its 2nd operand assuming row-major [K,N] (it
+  # transposes-while-tiling). A genuinely-transposed [N,K]-contiguous operand (e.g.
+  # B.T.contiguous().realize(), or any materialized transposed weight) has identical byte size K*N,
+  # so the size-based recovery above can't tell it from [K,N] and would silently mis-tile it. Verify
+  # the stride structure: in [K,N] the contraction k is the strided dim and the output dim n is
+  # contiguous-ish, i.e. max(loop coeff) <= min(reduce coeff); [N,K] inverts that. (Calibrated on the
+  # matmul test suite: [K,N] gives loop in {1,4}, reduce in {16,17,64,128,16384,32768} or empty;
+  # [N,K] gives loop={K}, reduce={1}.) Reject -> CPU when it's not [K,N]; can't tell -> reject.
+  if N > 1:
+    Rc, Lc, p2_nonaffine = set(), set(), False
+    for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is params[2]]:
+      off = ix.src[1]; rs = [u for u in off.toposort() if u.op is Ops.RANGE]
+      base = off.substitute({x: x.const_like(0) for x in rs}).simplify()
+      if base.op is not Ops.CONST: p2_nonaffine = True; continue
+      for r in rs:
+        b = off.substitute({x: x.const_like(1 if x is r else 0) for x in rs}).simplify()
+        if b.op is Ops.CONST and (b.arg - base.arg):
+          (Rc if (len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE) else Lc).add(b.arg - base.arg)
+    if p2_nonaffine:               layout_ok = False                  # can't verify -> reject (safe)
+    elif Rc and Lc:                layout_ok = max(Lc) <= min(Rc)     # k strided, n contiguous-ish
+    elif Rc:                       layout_ok = min(Rc) > 1            # n unrolled (stride 1), k strided
+    elif Lc:                       layout_ok = (min(Lc) == 1)         # k unrolled (strided), n contiguous
+    else:                          layout_ok = True                  # both unrolled / degenerate
+    if not layout_ok:
+      if dbg: print(f"[mm-match] reject: PARAM2 not [K,N] (reduce={sorted(Rc)} loop={sorted(Lc)})")
+      return None
+
   if dbg: print(f"[mm-match] M={M} K={K} N={N} (out={out_sz} p1={p1_sz} p2={p2_sz})")
   return (M, N, K, fn)
 
