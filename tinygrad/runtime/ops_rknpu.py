@@ -427,6 +427,118 @@ def _try_match_reduce(uops):
   if any(c >= K for c, _e, is_red in dims if is_red): return None
   return (M, K)
 
+def _try_match_conv(uops):
+  """Return NCHW conv geometry {N,Cin,IH,IW,Cout,KH,KW,OH,OW,sh,sw} if this kernel is a
+  tinygrad-lowered direct conv2d (the CNA's native op), else None.
+
+  The CNA is a direct-convolution engine; matmul is just its 1x1 case (see npu_matmul.c:
+  weight_width/height, conv_x/y_stride, datain_w/h/c, weight_kernels). tinygrad lowers conv2d to
+  `(pool(x) * weight).sum(cin,kh,kw)` — the input is read through an overlapping windowed
+  ShapeTracker. We recover geometry from the INPUT param's affine index, which survives
+  UPCAST/UNROLL/vectorization cleanly (spatial dims stay LOOP ranges, the channel/kernel
+  contraction is REDUCE ranges and/or unrolled constant offsets), plus the three PARAM byte sizes.
+  Output/weight indices are NOT relied on — output-channel UPCAST makes the output index non-affine.
+
+  Safety: a candidate (Cin, IW, KW) factorization is accepted ONLY if the exact set of input bytes
+  it would read equals what the kernel actually reads, so a non-conv (or wrong geometry) can never
+  mis-dispatch — important because a wrong `elements`/geometry on this NPU is an OOB DMA that wedges
+  the SoC. KH=KW=1 collapses to the matmul lowering and is left to _try_match_matmul. Out of scope
+  (returns None -> CPU fallback): dilation!=1, padding!=0, groups!=1, bias, non-fp16.
+
+  NOTE: not yet wired into render() — that pairs with adding an `npu_conv_fp16` CNA entry point
+  (generalizing gen_matmul_fp16's 1x1 config to weight_width/height + conv strides)."""
+  params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u: u.arg)
+  if len(params) != 3 or [p.arg for p in params] != [0, 1, 2]: return None
+  out_p, in_p, w_p = params
+  if any(p.dtype.base is not dtypes.half for p in params): return None
+  out_sz, in_sz, w_sz = out_p.dtype.size, in_p.dtype.size, w_p.dtype.size
+
+  def extent(r): return r.src[0].arg if r.src and r.src[0].op is Ops.CONST else None
+  def is_reduce(r): return len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE
+
+  # affine {range: coeff} for the INPUT param, plus per-node (const, [(coeff,extent)...], vec) so we
+  # can reconstruct the exact set of input bytes read.
+  in_idx = [u for u in uops if u.op is Ops.INDEX and u.src[0] is in_p]
+  if not in_idx: return None
+  ic, nodes = {}, []
+  for ix in in_idx:
+    off = ix.src[1]
+    rs = [u for u in off.toposort() if u.op is Ops.RANGE]
+    base = off.substitute({x: x.const_like(0) for x in rs}).simplify()
+    if base.op is not Ops.CONST: return None
+    terms = []
+    for r in rs:
+      b = off.substitute({x: x.const_like(1 if x is r else 0) for x in rs}).simplify()
+      if b.op is not Ops.CONST: return None
+      cf = b.arg - base.arg
+      if cf == 0: continue
+      if ic.get(r, cf) != cf: return None
+      ic[r] = cf
+      e = extent(r)
+      if e is None: return None
+      terms.append((cf, e))
+    V = 1
+    for c in uops:
+      if c.op is Ops.CAST and ix in c.src and c.dtype.count > 1: V = c.dtype.count
+    nodes.append((base.arg, terms, V))
+
+  loops = [r for r in ic if not is_reduce(r)]
+  if not any(is_reduce(r) for r in ic) or len(loops) < 2: return None   # need contraction + 2 spatial
+  loops.sort(key=lambda r: ic[r])
+  ow, oh = loops[0], loops[1]                          # ow inner (stride sw), oh next (stride sh*IW)
+  OW, OH, sw, sh_IW = extent(ow), extent(oh), ic[ow], ic[oh]
+  N = 1
+  for r in loops[2:]: N *= extent(r)                   # remaining loop ranges = batch
+  if N < 1 or out_sz % (N * OH * OW): return None
+  Cout = out_sz // (N * OH * OW)
+  if Cout < 1 or w_sz % Cout: return None
+  W = w_sz // Cout                                     # = Cin * KH * KW
+
+  # exact set of input offsets the kernel reads (vec/tiling-agnostic); bail if too large to enumerate
+  visits = 1
+  for _c, terms, Vv in nodes:
+    n = Vv
+    for _cf, e in terms: n *= e
+    visits += n
+  if visits > (1 << 20): return None
+  actual = set()
+  def rec(i, terms, acc, V, out):
+    if i == len(terms):
+      for l in range(V): out.add(acc + l)
+      return
+    cf, e = terms[i]
+    for v in range(e): rec(i + 1, terms, acc + v * cf, V, out)
+  for c, terms, V in nodes: rec(0, terms, c, V, actual)
+
+  def divisors(n): return [d for d in range(1, n + 1) if n % d == 0]
+  for Cin in divisors(W):
+    if in_sz % N or (in_sz // N) % Cin: continue
+    IHIW = (in_sz // N) // Cin
+    KHKW = W // Cin
+    if KHKW <= 1: continue                             # KH=KW=1 -> matmul's job
+    for IW in divisors(IHIW):
+      IH = IHIW // IW
+      if sh_IW % IW: continue
+      sh = sh_IW // IW
+      if sh < 1 or sw < 1 or IW < 1: continue
+      for KW in divisors(KHKW):
+        KH = KHKW // KW
+        if IW < KW or IH < KH: continue
+        if OW != (IW - KW) // sw + 1 or OH != (IH - KH) // sh + 1: continue
+        pred = set()
+        for n in range(N):
+          for cin in range(Cin):
+            for y in range(OH):
+              for x in range(OW):
+                b = n * Cin * IHIW + cin * IHIW + (y * sh) * IW + (x * sw)
+                for ky in range(KH):
+                  row = b + ky * IW
+                  for kx in range(KW): pred.add(row + kx)
+        if pred == actual:
+          return dict(N=N, Cin=Cin, IH=IH, IW=IW, Cout=Cout, KH=KH, KW=KW,
+                      OH=OH, OW=OW, sh=sh, sw=sw)
+  return None
+
 # Post-devectorization shape: GEP(LOAD(CAST(INDEX(PARAM, ...))))
 _param_gep = UPat(Ops.GEP, src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),))
 _const_fp16 = UPat(Ops.CONST, dtype=dtypes.half, name="c")
