@@ -112,14 +112,15 @@ _lib.npu_neg_bf16.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ct
 # matmul: void npu_matmul_<dtype>(int fd, void* dst_va, u64 dst_dma, u64 dst_obj,
 #                                  const void* a_va, u64 a_dma,
 #                                  const void* b_va, u64 b_dma,
-#                                  int M, int K, int N)
+#                                  int M, int K, int N, int relu)
+# `relu` (0/1) fuses a max(0,x) BS-stage epilogue into the same NPU submit.
 for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8', 'npu_matmul_fp16_bt', 'npu_matmul_int8_bt']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int,
                                  ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_uint64,
-                                 ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
 # void npu_conv_fp16(int fd, void* dst_va, u64 dst_dma, u64 dst_obj, const void* feat_va, u64 feat_dma,
 #                    const void* weight_va, u64 weight_dma, int N,Cin,IH,IW,Cout,KH,KW,sh,sw,fp16_out)
@@ -288,6 +289,54 @@ _NPU_MATMUL = {
 # tinygrad versions, hence the guarded set).
 _MM_MUL_OPS = {Ops.MUL} | ({Ops.MULACC} if hasattr(Ops, 'MULACC') else set())
 
+# Select/compare/transcendental float ops that a plain matmul accumulation NEVER emits (it is
+# only MUL/ADD over the K loop). Their presence means an elementwise EPILOGUE was fused onto the
+# accumulator. MUL/ADD are deliberately excluded — they ARE the matmul. (Mirrors the _EXTRA
+# watchlist in _try_match_reduce, minus MUL.)
+_MM_EPILOGUE_OPS = {Ops.SUB, Ops.NEG, Ops.MAX, Ops.WHERE, Ops.RECIPROCAL, Ops.SQRT,
+                    Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CMPLT, Ops.CMPNE}
+
+def _is_zero_const(u): return u.op is Ops.CONST and u.arg == 0
+
+def _where_is_relu(w):
+  # ReLU lowers to where(0 < x, x, 0)  (or the symmetric where(x < 0, 0, x)).
+  if w.op is not Ops.WHERE or len(w.src) != 3: return False
+  cond, tval, fval = w.src
+  if cond.op is not Ops.CMPLT or len(cond.src) != 2: return False
+  lo, hi = cond.src
+  if _is_zero_const(lo) and tval is hi and _is_zero_const(fval): return True   # where(0<x, x, 0)
+  if _is_zero_const(hi) and _is_zero_const(tval) and fval is lo: return True   # where(x<0, 0, x)
+  return False
+
+def _max_is_relu(m):
+  return m.op is Ops.MAX and len(m.src) == 2 and (_is_zero_const(m.src[0]) or _is_zero_const(m.src[1]))
+
+def _matmul_epilogue(uops):
+  """Classify the fused epilogue on a matmul kernel: 'plain', 'relu', or None.
+
+  None means a select/compare/transcendental epilogue is present that we can't fuse (sigmoid,
+  gelu, tanh, exp, ...); the caller MUST fall back to CPU rather than run a plain matmul and
+  silently drop it.
+
+  No dtype filter: plain matmuls — fp16 AND int8(->int32), aligned/unaligned/M-tiled — emit
+  ZERO select/compare/transcendental ops (verified by probe), so any such op means a fused
+  epilogue. We don't filter on float/half because the int8 path's ReLU compares in int32, not
+  float. The relu-SHAPE check (where(0<x,x,0) / max(x,0)) is specific enough that it would not
+  match an index/padding mask (where(idx<bound, val, 0)) even if one appeared.
+
+  LIMITATION (pre-existing, unchanged by this matcher): a pure MUL/ADD-const epilogue — e.g.
+  (a@b)*2.0 or (a@b)+1.0 — uses only MUL/ADD, indistinguishable from the matmul body by op
+  type, so it classifies as 'plain' and the scale/offset is dropped. ReLU, bias-vector (4th
+  PARAM, rejected by the param-count check), and transcendental activations are handled; scalar
+  affine fusion is not. Revisit when wiring bias (Stage 2)."""
+  present = {u.op for u in uops if u.op in _MM_EPILOGUE_OPS}
+  if not present: return 'plain'
+  wheres = [u for u in uops if u.op is Ops.WHERE]
+  maxes  = [u for u in uops if u.op is Ops.MAX]
+  if present <= {Ops.WHERE, Ops.CMPLT} and wheres and all(_where_is_relu(w) for w in wheres): return 'relu'
+  if present == {Ops.MAX} and maxes and all(_max_is_relu(m) for m in maxes): return 'relu'
+  return None
+
 def _try_match_matmul(uops):
   """Return (M, N, K, fn) if this uop list is a tinygrad-lowered matmul of a supported dtype
   AND the wrapper can actually handle the size, else None.
@@ -322,6 +371,13 @@ def _try_match_matmul(uops):
   if not (any(u.op is Ops.DEFINE_REG for u in uops) or n_fmul >= 2):
     if dbg: print("[mm-match] reject: no K-accumulation (elementwise kernel?)")
     return None
+  # Classify any fused elementwise epilogue: plain matmul, fused ReLU (DPU BS stage), or an
+  # unrecognized activation we must NOT silently drop (-> CPU fallback). See _matmul_epilogue.
+  epi = _matmul_epilogue(uops)
+  if epi is None:
+    if dbg: print("[mm-match] reject: fused epilogue is not plain or relu (-> CPU)")
+    return None
+  relu = 1 if epi == 'relu' else 0
   params = sorted([u for u in uops if u.op is Ops.PARAM], key=lambda u: u.arg)
   if len(params) != 3: return None
   if params[0].arg != 0 or params[1].arg != 1 or params[2].arg != 2: return None
@@ -396,8 +452,8 @@ def _try_match_matmul(uops):
       fn = bt
       if dbg: print(f"[mm-match] PARAM2 is [N,K] -> {fn}")
 
-  if dbg: print(f"[mm-match] M={M} K={K} N={N} (out={out_sz} p1={p1_sz} p2={p2_sz})")
-  return (M, N, K, fn)
+  if dbg: print(f"[mm-match] M={M} K={K} N={N} relu={relu} (out={out_sz} p1={p1_sz} p2={p2_sz})")
+  return (M, N, K, fn, relu)
 
 def _try_match_reduce(uops):
   """Return (M, K) if this kernel is a pure SUM-reduce of an fp16 tensor over its contiguous
@@ -734,7 +790,7 @@ class RkRenderer(ClangJITRenderer):
     # element-wise path / CPU.
     mm = _try_match_matmul(uops)
     if mm is not None:
-      M, N, K, fn = mm
+      M, N, K, fn, relu = mm
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
       # PARAMs are emitted to bufs in arg order: 0=output, 1=A, 2=B (verified via probe).
@@ -744,7 +800,7 @@ class RkRenderer(ClangJITRenderer):
                 f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
                 f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
                 f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
-                f"{M}, {K}, {N});"]
+                f"{M}, {K}, {N}, {relu});"]
         self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
@@ -876,12 +932,12 @@ class RkRenderer(ClangJITRenderer):
       'void npu_max_scalar_i16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, short scalar, int elements);',
       'void npu_max_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_max_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
-      'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
-      'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
-      'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
+      'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu);',
+      'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu);',
+      'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu);',
       'void npu_conv_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *feat_va, unsigned long long feat_dma, const void *weight_va, unsigned long long weight_dma, int N, int Cin, int IH, int IW, int Cout, int KH, int KW, int sh, int sw, int fp16_out);',
-      'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
-      'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N);',
+      'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu);',
+      'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu);',
       'void npu_sum_lastaxis_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *src_va, unsigned long long src_dma, int M, int K);',
     ]
     return defines
