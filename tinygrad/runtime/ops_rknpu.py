@@ -112,18 +112,20 @@ _lib.npu_neg_bf16.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ct
 # matmul: void npu_matmul_<dtype>(int fd, void* dst_va, u64 dst_dma, u64 dst_obj,
 #                                  const void* a_va, u64 a_dma,
 #                                  const void* b_va, u64 b_dma,
-#                                  int M, int K, int N, int relu, float bias)
-# `relu` (0/1) fuses max(0,x); `bias` (scalar) fuses x+bias — both in the BS stage,
-# same submit. relu is auto-dispatched (see _matmul_epilogue); scalar bias is
-# ctypes-only (render passes 0.0) — a const-add epilogue can't be reliably told from
-# the matmul's own ADDs, and per-channel bias is unsolved (see memory).
+#                                  int M, int K, int N, int relu, float bias, const float *pcbias)
+# `relu` (0/1) fuses max(0,x); `bias` (scalar) fuses x+bias; `pcbias` (host fp32 array[N] or
+# NULL) fuses the per-channel bias x+bias[n] — all in the BS stage, same submit. relu AND
+# per-channel bias are auto-dispatched (see _matmul_epilogue / _try_match_matmul); scalar `bias`
+# is ctypes-only (render passes 0.0) — a const-add epilogue can't be reliably told from the
+# matmul's own ADDs. pcbias is fp16-only in the runtime (bf16/int8 wrappers take but ignore it).
 for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8', 'npu_matmul_fp16_bt', 'npu_matmul_int8_bt']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int,
                                  ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_uint64,
-                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float,
+                                 ctypes.c_void_p]
 
 # void npu_conv_fp16(int fd, void* dst_va, u64 dst_dma, u64 dst_obj, const void* feat_va, u64 feat_dma,
 #                    const void* weight_va, u64 weight_dma, int N,Cin,IH,IW,Cout,KH,KW,sh,sw,fp16_out)
@@ -329,9 +331,10 @@ def _matmul_epilogue(uops):
 
   LIMITATION (pre-existing, unchanged by this matcher): a pure MUL/ADD-const epilogue — e.g.
   (a@b)*2.0 or (a@b)+1.0 — uses only MUL/ADD, indistinguishable from the matmul body by op
-  type, so it classifies as 'plain' and the scale/offset is dropped. ReLU, bias-vector (4th
-  PARAM, rejected by the param-count check), and transcendental activations are handled; scalar
-  affine fusion is not. Revisit when wiring bias (Stage 2)."""
+  type, so it classifies as 'plain' and the scale/offset is dropped. ReLU and a per-channel
+  bias-vector (4th PARAM, folded via pcbias — see _try_match_matmul/_validate_bias, and it
+  composes with relu since the bias ADD is invisible here) are handled, as are transcendental
+  activations (-> CPU); a scalar const-affine fusion is not."""
   present = {u.op for u in uops if u.op in _MM_EPILOGUE_OPS}
   if not present: return 'plain'
   wheres = [u for u in uops if u.op is Ops.WHERE]
@@ -340,9 +343,68 @@ def _matmul_epilogue(uops):
   if present == {Ops.MAX} and maxes and all(_max_is_relu(m) for m in maxes): return 'relu'
   return None
 
+def _affine_offset(off):
+  """Decompose an INDEX offset uop into (base, {range: linear_coeff}) by symbolic substitution
+  (invariant under UPCAST/UNROLL/vectorization). Returns None if the offset isn't affine in its
+  ranges. Mirrors the coeff-recovery idiom in _try_match_conv/_try_match_reduce."""
+  rs = [u for u in off.toposort() if u.op is Ops.RANGE]
+  base = off.substitute({x: x.const_like(0) for x in rs}).simplify()
+  if base.op is not Ops.CONST: return None
+  co = {}
+  for r in rs:
+    b = off.substitute({x: x.const_like(1 if x is r else 0) for x in rs}).simplify()
+    if b.op is not Ops.CONST: return None
+    co[r] = b.arg - base.arg
+  return base.arg, co
+
+def _validate_bias(uops, B_p, bias_p, N):
+  """True iff `bias_p` is a per-channel bias vector broadcast-ADDed over the output's N (channel)
+  axis — the `+ bias[n]` of `a@b + bias[n]` (e.g. nn.Linear). SOUND: any structural deviation
+  returns False so the matmul matcher falls back to CPU rather than fold the wrong thing.
+
+  The N (output-channel) axis is identified from the B=[K,N] operand, NOT the output or A — tinygrad
+  upcasts those into non-affine stores once M is large. B's index depends (nonzero coeff) only on the
+  K (reduce) range and the N range(s), so an N range is just a non-reduce range that indexes B (true
+  for the [N,K] transposed weight too). M never indexes B, so a per-row bias[m] — depending on an M
+  range — is rejected even when M==N. A genuine bias[n] depends ONLY on N ranges (hence invariant over
+  M and the K contraction) and, with its vectorized lane width, tiles exactly [0,N): each channel once."""
+  if bias_p.dtype.base is not dtypes.half: return False     # pcbias fold is fp16-only in the runtime
+  if bias_p.dtype.size != N: return False                   # must be exactly the N-length channel vector
+  def is_reduce(r): return len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE
+  n_ranges = set()                                          # B's non-reduce nonzero-coeff ranges = N axis
+  for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is B_p]:
+    r = _affine_offset(ix.src[1])                           # tolerate (skip) non-affine B index nodes
+    if r is None: continue
+    n_ranges |= {rng for rng, c in r[1].items() if c != 0 and not is_reduce(rng)}
+  if not n_ranges: return False
+  bias_idx = [u for u in uops if u.op is Ops.INDEX and u.src[0] is bias_p]
+  if not bias_idx: return False
+  for ix in bias_idx:
+    r = _affine_offset(ix.src[1])
+    if r is None: return False
+    base, co = r
+    if base != 0: return False                              # bias starts at channel 0 (N not tiled)
+    terms = []
+    for rng, c in co.items():
+      if c == 0: continue
+      if rng not in n_ranges: return False                 # touches M/K -> not a per-channel bias[n]
+      ext = rng.src[0].arg if rng.src and rng.src[0].op is Ops.CONST else None
+      if ext is None: return False
+      terms.append((c, ext))
+    V = 1                                                   # vectorized lanes of this load (innermost dim)
+    for c in uops:
+      if c.op is Ops.CAST and ix in c.src and c.dtype.count > 1: V = c.dtype.count
+    stride = V                                              # require contiguous tiling of exactly [0,N)
+    for c, e in sorted(terms):
+      if c != stride: return False
+      stride *= e
+    if stride != N: return False
+  return True
+
 def _try_match_matmul(uops):
-  """Return (M, N, K, fn) if this uop list is a tinygrad-lowered matmul of a supported dtype
-  AND the wrapper can actually handle the size, else None.
+  """Return (M, N, K, fn, relu, bias_pidx) if this uop list is a tinygrad-lowered matmul of a
+  supported dtype AND the wrapper can actually handle the size, else None. `bias_pidx` is the PARAM
+  arg of a fused per-channel bias vector (`a@b + bias[n]`), or None for a plain/relu matmul.
 
   Detection is size-based, not kernel-name-based, because tinygrad's loop-opt passes (UPCAST,
   UNROLL, etc.) rename `r_M_N_K` into multi-axis forms like `r_50_4_2_4_4_16_4`. The PARAM
@@ -382,8 +444,10 @@ def _try_match_matmul(uops):
     return None
   relu = 1 if epi == 'relu' else 0
   params = sorted([u for u in uops if u.op is Ops.PARAM], key=lambda u: u.arg)
-  if len(params) != 3: return None
+  # 3 PARAMs = plain/relu matmul (out, A, B); a 4th PARAM is the per-channel bias of a@b+bias[n].
+  if len(params) not in (3, 4): return None
   if params[0].arg != 0 or params[1].arg != 1 or params[2].arg != 2: return None
+  if len(params) == 4 and params[3].arg != 3: return None
   # PARAM dtypes are PtrDType wrappers; .base unwraps to the scalar element type.
   out_dt = params[0].dtype.base
   in_dt  = params[1].dtype.base
@@ -455,8 +519,23 @@ def _try_match_matmul(uops):
       fn = bt
       if dbg: print(f"[mm-match] PARAM2 is [N,K] -> {fn}")
 
-  if dbg: print(f"[mm-match] M={M} K={K} N={N} relu={relu} (out={out_sz} p1={p1_sz} p2={p2_sz})")
-  return (M, N, K, fn, relu)
+  # PER-CHANNEL BIAS. A 4th PARAM is the `+ bias[n]` of `a@b + bias[n]`. Only the fp16 wrappers fold
+  # pcbias (bf16/int8 ignore it), and the bias must be a genuine broadcast-over-N vector — otherwise
+  # fall back to CPU (never silently drop a 4th input). The bias ADD is invisible to _matmul_epilogue
+  # (plain ADD), so relu composes: relu(a@b + bias[n]) classifies as 'relu' AND folds the bias.
+  bias_pidx = None
+  if len(params) == 4:
+    if fn not in ('npu_matmul_fp16', 'npu_matmul_fp16_bt'):
+      if dbg: print(f"[mm-match] reject: 4th (bias) PARAM but {fn} has no pcbias fold -> CPU")
+      return None
+    if not _validate_bias(uops, params[2], params[3], N):
+      if dbg: print("[mm-match] reject: 4th PARAM is not a broadcast-over-N bias -> CPU")
+      return None
+    bias_pidx = params[3].arg
+
+  if dbg: print(f"[mm-match] M={M} K={K} N={N} relu={relu} bias={bias_pidx is not None} "
+                f"(out={out_sz} p1={p1_sz} p2={p2_sz})")
+  return (M, N, K, fn, relu, bias_pidx)
 
 def _try_match_reduce(uops):
   """Return (M, K) if this kernel is a pure SUM-reduce of an fp16 tensor over its contiguous
@@ -789,21 +868,32 @@ class RkRenderer(ClangJITRenderer):
     # tinygrad lowers `a @ b` to a reduce-loop kernel named "r_M_N_K" (with ANSI color codes).
     # When the AST contains: 3 PARAMs (output, A, B) with ptr sizes M*N / M*K / K*N, one
     # STORE, a REDUCE_AXIS or RANGE loop, and the output dtype is in _NPU_MATMUL, redirect
-    # the whole kernel to a single npu_matmul_<dtype>() call. Otherwise fall through to the
-    # element-wise path / CPU.
+    # the whole kernel to a single npu_matmul_<dtype>() call. A 4th PARAM that is a per-channel
+    # bias vector (a@b + bias[n], e.g. nn.Linear) is folded via pcbias (fp16 wrappers only).
+    # Otherwise fall through to the element-wise path / CPU.
     mm = _try_match_matmul(uops)
     if mm is not None:
-      M, N, K, fn, relu = mm
+      M, N, K, fn, relu, bias_pidx = mm
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
-      # PARAMs are emitted to bufs in arg order: 0=output, 1=A, 2=B (verified via probe).
-      if len(ptr_indices) == 3:
+      # PARAMs emit to bufs in arg order: 0=output, 1=A, 2=B, (3=per-channel bias) (verified via probe).
+      n_ptr = 4 if bias_pidx is not None else 3
+      if len(ptr_indices) == n_ptr:
         i_out, i_A, i_B = ptr_indices[0], ptr_indices[1], ptr_indices[2]
-        body = [f"  {fn}(npu_fd, "
+        pre = []
+        # pcbias: the wrapper reads a host fp32 array[N] during weight packing. The bias PARAM is fp16
+        # (matched in _validate_bias), so upcast it into a stack temp here (N is a compile-time literal).
+        if bias_pidx is not None:
+          i_bias = ptr_indices[3]
+          pre = [f"  float npu_pcbias[{N}];",
+                 f"  for (int _i = 0; _i < {N}; _i++) "
+                 f"npu_pcbias[_i] = (float)((const __fp16*){bufs[i_bias][0]})[_i];"]
+        bias_arg = "npu_pcbias" if bias_pidx is not None else "(const float*)0"
+        body = pre + [f"  {fn}(npu_fd, "
                 f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
                 f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
                 f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
-                f"{M}, {K}, {N}, {relu}, 0.0f);"]
+                f"{M}, {K}, {N}, {relu}, 0.0f, {bias_arg});"]
         self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
@@ -935,12 +1025,12 @@ class RkRenderer(ClangJITRenderer):
       'void npu_max_scalar_i16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, short scalar, int elements);',
       'void npu_max_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_max_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
-      'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias);',
-      'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias);',
-      'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias);',
+      'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
+      'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
+      'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_conv_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *feat_va, unsigned long long feat_dma, const void *weight_va, unsigned long long weight_dma, int N, int Cin, int IH, int IW, int Cout, int KH, int KW, int sh, int sw, int fp16_out);',
-      'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias);',
-      'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias);',
+      'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
+      'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_sum_lastaxis_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *src_va, unsigned long long src_dma, int M, int K);',
     ]
     return defines
