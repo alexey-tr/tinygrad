@@ -551,6 +551,160 @@ def _try_match_matmul(uops):
                 f"(out={out_sz} p1={p1_sz} p2={p2_sz})")
   return (M, N, K, fn, relu, bias_pidx)
 
+def _try_match_batched_matmul(uops):
+  """Return a dict {Bh,M,K,N,fn,layout,bs_out,bs_a,bs_b} if this kernel is a BATCHED matmul
+  (attention's `q@kᵀ` / `attn@v`, shape [B,H,T,·]) of a supported dtype that the runtime can
+  handle, else None. v1: plain fp16 matmul only (no relu/bias epilogue, no int8) — anything else
+  falls back to CPU rather than silently dropping it.
+
+  WHY a separate matcher: the 2D `_try_match_matmul` recovers K via `K²=p1·p2/out`+isqrt, but a
+  batch dim multiplies all three PARAM sizes (→ `Bh·K²`), so isqrt goes non-integer and 2D rejects
+  it. Here we recover Bh from the loop structure FIRST, divide it out, then reuse the 2D size
+  recovery per-slice.
+
+  Recovery (empirically grounded on real RKNPU-lowered uops; see rknpu-batched-matmul-recovery
+  memory). For a batched matmul each operand's batch slice is contiguous, so the affine index of
+  every PARAM carries a batch RANGE whose stride is the per-slice element count:
+    out[b]: batch·(M·N) + m·N + n      A[b]: batch·(M·K) + m·K + ...     B[b]: batch·(K·N) + ...
+  Classify each range by which of the 3 PARAMs it indexes (nonzero affine coeff):
+    batch -> out & A & B   |   M -> out & A   |   N -> out & B   |   K(reduce) -> A & B (often unrolled)
+  - Accumulation guard: require >=1 range that indexes EXACTLY 2 of the 3 PARAMs (an M/N/K range).
+    A batched element-wise `A*B` has every range indexing all 3 (C[i]=A[i]*B[i]) -> no 2-of-3 range
+    -> rejected. This replaces the 2D matcher's MUL-count guard, which is unreliable here because
+    `rknpu_pm` rewrites the unrolled inner products `half*half` into CUSTOM 'npu_mul' nodes (so
+    n_fmul reads 0); see the memory note.
+  - Contiguity cross-check (the safety guard against mis-recovery -> silent corruption): the batch
+    axes must densely, nestedly tile each buffer with the per-slice block (M·N / M·K / K·N) as the
+    innermost unit. Mismatch -> reject.
+
+  Robust to the realities of on-device lowering (see the memory note): the batch dim appears as a
+  RANGE (small kernels) or the multicore `core_id` DEFINE_VAR (large kernels), and may split across
+  several axes (B>1); M/N/K are recovered from PARAM sizes (UPCAST-invariant), not loop extents.
+  """
+  import os, math
+  dbg = os.environ.get('NPU_MATMUL_DEBUG') == '1'
+  params = sorted([u for u in uops if u.op is Ops.PARAM], key=lambda u: u.arg)
+  # v1: exactly 3 PARAMs (out, A, B). A 4th (bias) batched matmul -> defer to CPU for now.
+  if len(params) != 3 or [p.arg for p in params] != [0, 1, 2]: return None
+  out_p, a_p, b_p = params
+  out_dt, in_dt = out_p.dtype.base, a_p.dtype.base
+  if b_p.dtype.base != in_dt: return None
+  fn = _NPU_MATMUL.get((in_dt, out_dt))
+  if fn != "npu_matmul_fp16": return None          # v1: fp16 only (int8/bf16 deferred)
+
+  # Per-PARAM affine map {axis_uop: coeff}. AXES = loop/reduce RANGEs + symbolic DEFINE_VARs. The
+  # batch dim of a batched matmul appears as EITHER a RANGE (small kernels) OR the multicore `core_id`
+  # global DEFINE_VAR (once tinygrad maps batch onto the global dim — which it does at realistic
+  # attention sizes, already splitting batch across the 3 cores). Decomposing over RANGEs only makes
+  # core_id a non-substituted residual and the index reads "non-affine"; including DEFINE_VARs
+  # recovers it cleanly. A consistent coeff per axis is required across a PARAM's INDEX uops (UPCAST
+  # splits a dim into several loads but keeps the outer stride identical). Non-affine -> bail.
+  axes = [u for u in uops if u.op in (Ops.RANGE, Ops.DEFINE_VAR)]
+  def axis_extent(a):
+    if a.op is Ops.RANGE: return a.src[0].arg if a.src and a.src[0].op is Ops.CONST else None
+    return (a.arg[2] - a.arg[1] + 1) if (isinstance(a.arg, tuple) and len(a.arg) >= 3) else None
+  def param_strides(p):
+    acc = {}
+    idxs = [u for u in uops if u.op is Ops.INDEX and u.src[0] is p]
+    if not idxs: return None
+    for ix in idxs:
+      off = ix.src[1]
+      base = off.substitute({x: x.const_like(0) for x in axes}).simplify()
+      if base.op is not Ops.CONST: return None      # truly non-affine -> bail
+      for a in axes:
+        b = off.substitute({x: x.const_like(1 if x is a else 0) for x in axes}).simplify()
+        if b.op is not Ops.CONST: return None
+        c = b.arg - base.arg
+        if c == 0: continue
+        if a in acc and acc[a] != c: return None     # inconsistent stride for an axis -> bail
+        acc[a] = c
+    return acc
+  so, sa, sb = param_strides(out_p), param_strides(a_p), param_strides(b_p)
+  if so is None or sa is None or sb is None: return None
+
+  # Classify every axis that indexes any operand by its (out,A,B) membership.
+  allr = set(so) | set(sa) | set(sb)
+  batch_r = [r for r in allr if r in so and r in sa and r in sb]
+  n_r     = [r for r in allr if r in so and r in sb and r not in sa]   # N axis: out & B, not A
+  two_of_three = [r for r in allr if (r in so) + (r in sa) + (r in sb) == 2]
+  if not two_of_three:                             # pure element-wise (all axes hit all 3) -> not a matmul
+    if dbg: print("[bmm-match] reject: no 2-of-3 axis (element-wise, not a contraction)")
+    return None
+  if not batch_r:                                  # no all-3 axis -> not batched; let the 2D matcher try
+    return None
+  # Bh = product of all batch-axis extents. A batch dim can split into several axes — e.g. B>1 gives
+  # a RANGE for B and the core_id global for H, so Bh = 2 * 8 = 16 across two axes.
+  bext = [axis_extent(r) for r in batch_r]
+  if any(e is None or e < 1 for e in bext): return None
+  Bh = 1
+  for e in bext: Bh *= e
+  if Bh < 2: return None                           # Bh==1 is just a 2D matmul -> let the 2D matcher take it
+
+  # Per-slice size recovery: divide the batch factor out of the PARAM byte-sizes, then reuse the
+  # exact 2D factorization. (.dtype.size is element-count for the realized-half inputs we require.)
+  out_sz, a_sz, b_sz = out_p.dtype.size, a_p.dtype.size, b_p.dtype.size
+  if any(s < 1 or s % Bh != 0 for s in (out_sz, a_sz, b_sz)): return None
+  ps_o, ps_a, ps_b = out_sz // Bh, a_sz // Bh, b_sz // Bh
+  if (ps_a * ps_b) % ps_o != 0: return None
+  k_sq = (ps_a * ps_b) // ps_o
+  K = math.isqrt(k_sq)
+  if K * K != k_sq or K < 1: return None
+  if ps_a % K or ps_b % K: return None
+  M, N = ps_a // K, ps_b // K
+  if M * N != ps_o or M < 1 or N < 1: return None
+
+  # Contiguity cross-check (the guard against mis-recovery -> silent corruption): the batch axes must
+  # densely, nestedly tile each buffer with the per-slice block (M·N / M·K / K·N) as the innermost
+  # unit. Sort batch axes by stride and require each stride to equal the running block size; the final
+  # span must equal the whole buffer. This proves every slice is contiguous (-> pure pointer math) and
+  # that (Bh,M,K,N) is the true factorization. Holds for any number of batch axes (B>1 case).
+  def tiles(strides, slice_sz, total):
+    expect = slice_sz
+    for st, ext in sorted((strides[r], axis_extent(r)) for r in batch_r):
+      if st != expect: return False
+      expect *= ext
+    return expect == total
+  if not (tiles(so, M * N, out_sz) and tiles(sa, M * K, a_sz) and tiles(sb, K * N, b_sz)):
+    if dbg: print("[bmm-match] reject: batch axes do not tile contiguously (non-dense slices)")
+    return None
+
+  # Plain matmul only (v1): any fused select/compare/transcendental (relu, sigmoid, ...) -> CPU.
+  if _matmul_epilogue(uops) != 'plain':
+    if dbg: print("[bmm-match] reject: fused epilogue (v1 is plain-only) -> CPU")
+    return None
+
+  # B layout per slice: for q@kᵀ (k contiguous [.,T,d]) the slice is [N,K] (N strided by K, K
+  # contiguous) -> pre-transposed `_bt` fast path; for attn@v / a materialized [K,N] the slice is
+  # [K,N] (N contiguous) -> normal pack. Decide from the N axis's stride in B. Under UPCAST the N
+  # axis carries only the OUTER factor, so its B-stride is (inner_unroll x per-element-N-stride):
+  # for [N,K] that is a multiple of K (>= K); for [K,N] it is the small inner-unroll width (< K).
+  layout = 'kn'
+  if N > 1:
+    if not n_r:                                    # N fully unrolled and ambiguous -> be safe, reject
+      if dbg: print("[bmm-match] reject: no N axis to disambiguate B layout")
+      return None
+    nstride_b = min(sb[r] for r in n_r)            # smallest N step in B
+    layout = 'nk' if (nstride_b >= K and nstride_b % K == 0) else 'kn'
+  if layout == 'nk':
+    fn = 'npu_matmul_fp16_bt'
+
+  # Per-slice CBUF tile feasibility (mirror _try_match_matmul's envelope). K-tiling is future work;
+  # a slice that cannot fit one CBUF pass -> CPU.
+  elem_bytes = 2
+  K_pad = ((K + 31) // 32) * 32
+  CBUF_BANK, CBUF_BANKS_USABLE = 32768, 11
+  if K_pad * elem_bytes > CBUF_BANK: return None
+  weight_banks_min = (K_pad * 16 * elem_bytes + CBUF_BANK - 1) // CBUF_BANK
+  data_banks_avail = CBUF_BANKS_USABLE - weight_banks_min
+  Mt_floor = 1 if M == 1 else 4
+  if data_banks_avail < 1 or Mt_floor * K_pad * elem_bytes > data_banks_avail * CBUF_BANK:
+    return None
+
+  if dbg: print(f"[bmm-match] Bh={Bh} M={M} K={K} N={N} fn={fn} layout={layout} "
+                f"(strides out={so[br]} a={sa[br]} b={sb[br]})")
+  return {'Bh': Bh, 'M': M, 'K': K, 'N': N, 'fn': fn, 'layout': layout,
+          'bs_out': M * N, 'bs_a': M * K, 'bs_b': K * N}
+
 def _try_match_reduce(uops):
   """Return (M, K) if this kernel is a pure SUM-reduce of an fp16 tensor over its contiguous
   last axis/axes — routable to npu_sum_lastaxis_fp16 (rowsum via matmul-by-ones, validated in
