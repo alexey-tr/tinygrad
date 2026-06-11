@@ -141,6 +141,11 @@ _lib.npu_conv_fp16.argtypes = [ctypes.c_int,
 #                            const void* src_va, u64 src_dma, int M, int K)
 # Sum over the contiguous last axis: dst[m] = sum_k src[m*K + k] (rowsum via matmul-by-ones).
 _lib.npu_sum_lastaxis_fp16.restype = None
+_lib.npu_max_lastaxis_fp16.restype = None
+_lib.npu_max_lastaxis_fp16.argtypes = [ctypes.c_int,
+                                       ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+                                       ctypes.c_void_p, ctypes.c_uint64,
+                                       ctypes.c_int, ctypes.c_int]
 _lib.npu_sum_lastaxis_fp16.argtypes = [ctypes.c_int,
                                        ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
                                        ctypes.c_void_p, ctypes.c_uint64,
@@ -569,10 +574,14 @@ def _try_match_reduce(uops):
   M, K = out_sz, in_sz // out_sz
   if K < 8: return None
 
-  # pure reduce: the accumulating ADD is fine; any other float/half ALU => fused => fall back
-  _EXTRA = {Ops.MUL, Ops.SUB, Ops.NEG, Ops.MAX, Ops.WHERE, Ops.RECIPROCAL, Ops.SQRT,
+  # pure reduce: ONE accumulator op (ADD=sum, MAX=max) and no other float/half ALU => else fused
+  _EXTRA = {Ops.MUL, Ops.SUB, Ops.NEG, Ops.WHERE, Ops.RECIPROCAL, Ops.SQRT,
             Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CMPLT, Ops.CMPNE}
   if any(u.op in _EXTRA and u.dtype.scalar() in (dtypes.float, dtypes.half) for u in uops): return None
+  has_max = any(u.op is Ops.MAX and u.dtype.scalar() in (dtypes.float, dtypes.half) for u in uops)
+  kind = 'max' if has_max else 'sum'
+  # max path: only the captured M=1,K=256 geometry (npu_max256 pack recipe)
+  if kind == 'max' and (out_sz != 1 or in_sz != 256): return None
 
   in_off = next((u.src[1] for u in uops if u.op is Ops.INDEX and u.src[0] is in_p), None)
   if in_off is None: return None
@@ -609,7 +618,7 @@ def _try_match_reduce(uops):
   # block alignment: loops outer (>=K), reduces inner (<K) => each output gets a clean K-block
   if any(c < K for c, _e, is_red in dims if not is_red): return None
   if any(c >= K for c, _e, is_red in dims if is_red): return None
-  return (M, K)
+  return (M, K, kind)
 
 def _try_match_conv(uops):
   """Return NCHW conv geometry {N,Cin,IH,IW,Cout,KH,KW,OH,OW,sh,sw} if this kernel is a
@@ -902,12 +911,13 @@ class RkRenderer(ClangJITRenderer):
     # PARAMs emit to bufs in arg order: 0=output, 1=input (same convention as matmul).
     rd = _try_match_reduce(uops)
     if rd is not None:
-      M, K = rd
+      M, K, kind = rd
+      fn = "npu_max_lastaxis_fp16" if kind == 'max' else "npu_sum_lastaxis_fp16"
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
       if len(ptr_indices) == 2:
         i_out, i_in = ptr_indices[0], ptr_indices[1]
-        body = [f"  npu_sum_lastaxis_fp16(npu_fd, "
+        body = [f"  {fn}(npu_fd, "
                 f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
                 f"(const void*){bufs[i_in][0]}, dma_{i_in}, "
                 f"{M}, {K});"]
@@ -1031,6 +1041,7 @@ class RkRenderer(ClangJITRenderer):
       'void npu_conv_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *feat_va, unsigned long long feat_dma, const void *weight_va, unsigned long long weight_dma, int N, int Cin, int IH, int IW, int Cout, int KH, int KW, int sh, int sw, int fp16_out);',
       'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
+      'void npu_max_lastaxis_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *src_va, unsigned long long src_dma, int M, int K);',
       'void npu_sum_lastaxis_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *src_va, unsigned long long src_dma, int M, int K);',
     ]
     return defines
