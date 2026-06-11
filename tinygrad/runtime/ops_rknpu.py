@@ -151,6 +151,15 @@ _lib.npu_sum_lastaxis_fp16.argtypes = [ctypes.c_int,
                                        ctypes.c_void_p, ctypes.c_uint64,
                                        ctypes.c_int, ctypes.c_int]
 
+# void npu_exp_fp16(int fd, uint64_t dst_dma, uint64_t src_dma, int N)
+_lib.npu_exp_fp16.restype  = None
+_lib.npu_exp_fp16.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+
+# void npu_div(int fd, uint64_t dst_dma, uint64_t dst_obj, uint64_t srcA_dma, uint64_t srcB_dma, int elements)
+_lib.npu_div.restype  = None
+_lib.npu_div.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64,
+                         ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+
 # void mem_destroy(int fd, uint32_t handle, uint64_t obj_addr)
 _lib.mem_destroy.restype = None
 _lib.mem_destroy.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64]
@@ -842,6 +851,17 @@ rknpu_pm = PatternMatcher([
   # bf16: unary negate
   (UPat(Ops.NEG, dtype=dtypes.bfloat16, name="u", src=(_param_gep,)),
    lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
+  # fp16 divide: a / b lowers to MUL(gep_a, RECIPROCAL(gep_b)). Rewrite to npu_div(a, b).
+  (UPat(Ops.MUL, dtype=dtypes.half,
+        src=(UPat(Ops.GEP, name="ga", src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),)),
+             UPat(Ops.RECIPROCAL, dtype=dtypes.half,
+                  src=(UPat(Ops.GEP, name="gb", src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),)),)))),
+   lambda ga, gb: UOp(Ops.CUSTOM, dtypes.half, (ga, gb), "npu_div")),
+  (UPat(Ops.MUL, dtype=dtypes.half,
+        src=(UPat(Ops.RECIPROCAL, dtype=dtypes.half,
+                  src=(UPat(Ops.GEP, name="ga", src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),)),)),
+             UPat(Ops.GEP, name="gb", src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),)))),
+   lambda ga, gb: UOp(Ops.CUSTOM, dtypes.half, (gb, ga), "npu_div")),
 ])
 
 
@@ -963,7 +983,7 @@ class RkRenderer(ClangJITRenderer):
 
     # rknpu_pm rewrites eligible fp16 ALU ops to CUSTOM nodes tagged with the NPU fn name.
     # If any such node survived to render time, this is an NPU-accelerable kernel.
-    _all_npu_fns = set(_NPU_FN.values()) | set(_NPU_FN_SCALAR.values()) | set(_NPU_NEG.values())
+    _all_npu_fns = set(_NPU_FN.values()) | set(_NPU_FN_SCALAR.values()) | set(_NPU_NEG.values()) | {"npu_div"}
     npu_ops = [u for u in uops if u.op is Ops.CUSTOM and u.arg in _all_npu_fns]
     # Guards against the pre-matcher having matched only a sub-expression of a complex kernel.
     # The NPU dispatch only emits ONE function call and would silently drop unmatched compute.
@@ -1043,6 +1063,7 @@ class RkRenderer(ClangJITRenderer):
       'void npu_add_scalar(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __fp16 scalar, int elements);',
       'void npu_sub_scalar(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __fp16 scalar, int elements);',
       'void npu_neg(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, int elements);',
+      'void npu_div(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_mul_scalar_f32(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, float scalar, int elements);',
       'void npu_add_scalar_f32(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, float scalar, int elements);',
       'void npu_sub_scalar_f32(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, float scalar, int elements);',
