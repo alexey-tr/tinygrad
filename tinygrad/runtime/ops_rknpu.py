@@ -653,15 +653,19 @@ def _try_match_conv(uops):
   # can reconstruct the exact set of input bytes read.
   in_idx = [u for u in uops if u.op is Ops.INDEX and u.src[0] is in_p]
   if not in_idx: return None
-  ic, nodes = {}, []
+  ic, nodes, has_dvar = {}, [], False
   for ix in in_idx:
     off = ix.src[1]
-    rs = [u for u in off.toposort() if u.op is Ops.RANGE]
-    base = off.substitute({x: x.const_like(0) for x in rs}).simplify()
+    rs  = [u for u in off.toposort() if u.op is Ops.RANGE]
+    dvs = [u for u in off.toposort() if u.op is Ops.DEFINE_VAR]  # core_id (multi-core dispatch)
+    if dvs: has_dvar = True
+    subs0 = {x: x.const_like(0) for x in rs + dvs}
+    base = off.substitute(subs0).simplify()
     if base.op is not Ops.CONST: return None
     terms = []
     for r in rs:
-      b = off.substitute({x: x.const_like(1 if x is r else 0) for x in rs}).simplify()
+      b = off.substitute({**{x: x.const_like(0) for x in dvs},
+                          **{x: x.const_like(1 if x is r else 0) for x in rs}}).simplify()
       if b.op is not Ops.CONST: return None
       cf = b.arg - base.arg
       if cf == 0: continue
@@ -675,17 +679,27 @@ def _try_match_conv(uops):
       if c.op is Ops.CAST and ix in c.src and c.dtype.count > 1: V = c.dtype.count
     nodes.append((base.arg, terms, V))
 
-  loops = [r for r in ic if not is_reduce(r)]
-  if not any(is_reduce(r) for r in ic) or len(loops) < 2: return None   # need contraction + 2 spatial
-  loops.sort(key=lambda r: ic[r])
-  ow, oh = loops[0], loops[1]                          # ow inner (stride sw), oh next (stride sh*IW)
-  OW, OH, sw, sh_IW = extent(ow), extent(oh), ic[ow], ic[oh]
-  N = 1
-  for r in loops[2:]: N *= extent(r)                   # remaining loop ranges = batch
-  if N < 1 or out_sz % (N * OH * OW): return None
-  Cout = out_sz // (N * OH * OW)
-  if Cout < 1 or w_sz % Cout: return None
-  W = w_sz // Cout                                     # = Cin * KH * KW
+  # Anchor on the CIN reduce loop: coeff = IH*IW (channel stride in the input), extent = Cin.
+  # This is robust to spatial-loop tiling/UPCAST that would break assumptions about loop ordering
+  # (e.g. tinygrad tiles OW by KW, making the OW-loop step = KW*stride, not stride).
+  reduces = [r for r in ic if is_reduce(r)]
+  if len(reduces) != 1: return None
+  cin_stride, Cin = ic[reduces[0]], extent(reduces[0])  # cin_stride = IH*IW
+  if cin_stride is None or Cin is None: return None
+  if in_sz % (Cin * cin_stride): return None
+  N_total = in_sz // (Cin * cin_stride)
+  if N_total < 1: return None
+  # Multi-core dispatch (has_dvar): tinygrad splits the batch across cores via the core_id
+  # DEFINE_VAR; with core_id substituted = 0 the access set covers only one batch item.
+  # Factorize against per-core sizes (N=1); tinygrad's global_size threads each call
+  # npu_conv_fp16(N=1) with the correct feat_va/dst_va slice for their batch item.
+  if has_dvar:
+    if out_sz % N_total: return None
+    N, out_sz_use = 1, out_sz // N_total
+  else:
+    if out_sz % N_total: return None
+    N, out_sz_use = N_total, out_sz
+  if out_sz_use < 1: return None
 
   # exact set of input offsets the kernel reads (vec/tiling-agnostic); bail if too large to enumerate
   visits = 1
@@ -704,32 +718,38 @@ def _try_match_conv(uops):
   for c, terms, V in nodes: rec(0, terms, c, V, actual)
 
   def divisors(n): return [d for d in range(1, n + 1) if n % d == 0]
-  for Cin in divisors(W):
-    if in_sz % N or (in_sz // N) % Cin: continue
-    IHIW = (in_sz // N) // Cin
-    KHKW = W // Cin
-    if KHKW <= 1: continue                             # KH=KW=1 -> matmul's job
-    for IW in divisors(IHIW):
-      IH = IHIW // IW
-      if sh_IW % IW: continue
-      sh = sh_IW // IW
-      if sh < 1 or sw < 1 or IW < 1: continue
+  # Search (Cout, IH, IW, KH, KW, sh, sw) consistent with all three param sizes.
+  for Cout in divisors(out_sz_use // N):
+    if w_sz % (Cout * Cin): continue
+    OHOW = (out_sz_use // N) // Cout
+    KHKW = w_sz // (Cout * Cin)
+    if KHKW <= 1: continue                              # KH=KW=1 → matmul's job
+    for IW in divisors(cin_stride):
+      IH = cin_stride // IW
       for KW in divisors(KHKW):
         KH = KHKW // KW
         if IW < KW or IH < KH: continue
-        if OW != (IW - KW) // sw + 1 or OH != (IH - KH) // sh + 1: continue
-        pred = set()
-        for n in range(N):
-          for cin in range(Cin):
-            for y in range(OH):
-              for x in range(OW):
-                b = n * Cin * IHIW + cin * IHIW + (y * sh) * IW + (x * sw)
-                for ky in range(KH):
-                  row = b + ky * IW
-                  for kx in range(KW): pred.add(row + kx)
-        if pred == actual:
-          return dict(N=N, Cin=Cin, IH=IH, IW=IW, Cout=Cout, KH=KH, KW=KW,
-                      OH=OH, OW=OW, sh=sh, sw=sw)
+        for sw in range(1, IW - KW + 2):
+          OW = (IW - KW) // sw + 1
+          if OHOW % OW: continue
+          OH = OHOW // OW
+          if OH < 1: continue
+          sh_num, sh_den = IH - KH, max(OH - 1, 1)
+          if sh_num % sh_den: continue
+          sh = max(sh_num // sh_den, 1)             # min stride 1 (IH==KH → OH=1 → sh=0 guard)
+          if (IH - KH) // sh + 1 != OH: continue
+          pred = set()
+          for n in range(N):
+            for cin in range(Cin):
+              for y in range(OH):
+                for x in range(OW):
+                  b = n * Cin * cin_stride + cin * cin_stride + (y * sh) * IW + (x * sw)
+                  for ky in range(KH):
+                    row = b + ky * IW
+                    for kx in range(KW): pred.add(row + kx)
+          if pred == actual:
+            return dict(N=N, Cin=Cin, IH=IH, IW=IW, Cout=Cout, KH=KH, KW=KW,
+                        OH=OH, OW=OW, sh=sh, sw=sw, multicore=has_dvar)
   return None
 
 def _conv_signature(uops):
@@ -744,12 +764,15 @@ def _conv_signature(uops):
   def is_reduce(r): return len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE
   in_p = params[1]
   for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is in_p]:
-    off = ix.src[1]; rs = [u for u in off.toposort() if u.op is Ops.RANGE]
-    base = off.substitute({x: x.const_like(0) for x in rs}).simplify()
+    off = ix.src[1]
+    rs  = [u for u in off.toposort() if u.op is Ops.RANGE]
+    dvs = [u for u in off.toposort() if u.op is Ops.DEFINE_VAR]  # core_id (multi-core dispatch)
+    base = off.substitute({x: x.const_like(0) for x in rs + dvs}).simplify()
     if base.op is not Ops.CONST: continue
     for r in rs:
       if not is_reduce(r): continue
-      b = off.substitute({x: x.const_like(1 if x is r else 0) for x in rs}).simplify()
+      b = off.substitute({**{x: x.const_like(0) for x in dvs},
+                          **{x: x.const_like(1 if x is r else 0) for x in rs}}).simplify()
       if b.op is Ops.CONST and (b.arg - base.arg) > 16: return True
   return False
 
@@ -860,13 +883,27 @@ class RkRenderer(ClangJITRenderer):
       if len(ptr_indices) == 3:
         i_out, i_in, i_w = ptr_indices[0], ptr_indices[1], ptr_indices[2]
         g = cv
-        body = [f"  npu_conv_fp16(npu_fd, "
-                f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
-                f"(const void*){bufs[i_in][0]}, dma_{i_in}, "
-                f"(const void*){bufs[i_w][0]}, dma_{i_w}, "
-                f"{g['N']}, {g['Cin']}, {g['IH']}, {g['IW']}, {g['Cout']}, "
-                f"{g['KH']}, {g['KW']}, {g['sh']}, {g['sw']}, 1);"]
-        self._npu_kernel_names.add(_strip_ansi(name))
+        if g.get('multicore'):
+          # Each tinygrad thread handles one batch item; core_id selects the slice.
+          in_stride  = g['Cin'] * g['IH'] * g['IW'] * 2   # bytes per batch item in input
+          out_stride = g['Cout'] * g['OH'] * g['OW'] * 2  # bytes per batch item in output
+          body = [
+            f"  npu_conv_fp16(npu_fd, "
+            f"(void*)((char*){bufs[i_out][0]} + (long long)core_id * {out_stride}), "
+            f"dma_{i_out} + (unsigned long long)core_id * {out_stride}, obj_{i_out}, "
+            f"(const void*)((char*){bufs[i_in][0]} + (long long)core_id * {in_stride}), "
+            f"dma_{i_in} + (unsigned long long)core_id * {in_stride}, "
+            f"(const void*){bufs[i_w][0]}, dma_{i_w}, "
+            f"1, {g['Cin']}, {g['IH']}, {g['IW']}, {g['Cout']}, "
+            f"{g['KH']}, {g['KW']}, {g['sh']}, {g['sw']}, 1);"]
+        else:
+          body = [f"  npu_conv_fp16(npu_fd, "
+                  f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
+                  f"(const void*){bufs[i_in][0]}, dma_{i_in}, "
+                  f"(const void*){bufs[i_w][0]}, dma_{i_w}, "
+                  f"{g['N']}, {g['Cin']}, {g['IH']}, {g['IW']}, {g['Cout']}, "
+                  f"{g['KH']}, {g['KW']}, {g['sh']}, {g['sw']}, 1);"]
+          self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
     # Conv-shaped but unparsed (heavy UPCAST): fall back to CPU rather than let the matmul matcher
     # size-factor it into a bogus matmul (silent wrong results). Correctness over coverage.
