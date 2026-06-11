@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, functools, mmap, queue, threading, math, re
+import ctypes, functools, mmap, os, queue, threading, math, re
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 def _strip_ansi(s: str) -> str: return _ANSI_RE.sub('', s)  # kernel display names are ANSI-colored; match on plain
@@ -955,11 +955,19 @@ class RkRenderer(ClangJITRenderer):
                  f"  for (int _i = 0; _i < {N}; _i++) "
                  f"npu_pcbias[_i] = (float)((const __fp16*){bufs[i_bias][0]})[_i];"]
         bias_arg = "npu_pcbias" if bias_pidx is not None else "(const float*)0"
-        body = pre + [f"  {fn}(npu_fd, "
+        npu_call = (f"{fn}(npu_fd, "
                 f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
                 f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
                 f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
-                f"{M}, {K}, {N}, {relu}, 0.0f, {bias_arg});"]
+                f"{M}, {K}, {N}, {relu}, 0.0f, {bias_arg})")
+        # For multicore kernels (global_size>1 → core_id param), the runner calls the
+        # C function once per thread. The NPU computes the full result in one call, so
+        # guard with core_id==0 to avoid redundant/overwriting launches.
+        has_core_id = any(bname == 'core_id' for bname, _ in bufs)
+        if has_core_id:
+          body = pre + [f"  if (core_id == 0) {{ {npu_call}; }}"]
+        else:
+          body = pre + [f"  {npu_call};"]
         self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
