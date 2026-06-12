@@ -127,6 +127,16 @@ for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8', 'npu_matmul
                                  ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float,
                                  ctypes.c_void_p]
 
+# void npu_matmul_fp16_batched(int fd, void* dst_va, u64 dst_dma, u64 dst_obj, const void* a_va, u64 a_dma,
+#   const void* b_va, u64 b_dma, int batch, int M, int K, int N, int weight_t, int relu)
+# `batch` contiguous [M,K]@[K,N] slices in ONE chained, multicore submission (attention q@kᵀ / attn@v).
+_lib.npu_matmul_fp16_batched.restype = None
+_lib.npu_matmul_fp16_batched.argtypes = [ctypes.c_int,
+                                 ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+                                 ctypes.c_void_p, ctypes.c_uint64,
+                                 ctypes.c_void_p, ctypes.c_uint64,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
 # void npu_conv_fp16(int fd, void* dst_va, u64 dst_dma, u64 dst_obj, const void* feat_va, u64 feat_dma,
 #                    const void* weight_va, u64 weight_dma, int N,Cin,IH,IW,Cout,KH,KW,sh,sw,fp16_out)
 _lib.npu_conv_fp16.restype = None
@@ -700,14 +710,9 @@ def _try_match_batched_matmul(uops):
   if data_banks_avail < 1 or Mt_floor * K_pad * elem_bytes > data_banks_avail * CBUF_BANK:
     return None
 
-  # Multicore-emittable iff the batch is exactly ONE core_id DEFINE_VAR (so tinygrad's global_size
-  # == Bh and thread tid maps 1:1 to slice tid). Then render can spread the Bh slices across the 3
-  # cores instead of a serial C loop. Mixed batches (a RANGE, or B>1 = RANGE x core_id) keep the loop.
-  multicore = (len(batch_r) == 1 and batch_r[0].op is Ops.DEFINE_VAR
-               and isinstance(batch_r[0].arg, tuple) and batch_r[0].arg[0] == 'core_id')
-  if dbg: print(f"[bmm-match] Bh={Bh} M={M} K={K} N={N} fn={fn} layout={layout} multicore={multicore} "
+  if dbg: print(f"[bmm-match] Bh={Bh} M={M} K={K} N={N} fn={fn} layout={layout} "
                 f"(strides out={so[br]} a={sa[br]} b={sb[br]})")
-  return {'Bh': Bh, 'M': M, 'K': K, 'N': N, 'fn': fn, 'layout': layout, 'multicore': multicore,
+  return {'Bh': Bh, 'M': M, 'K': K, 'N': N, 'fn': fn, 'layout': layout,
           'bs_out': M * N, 'bs_a': M * K, 'bs_b': K * N}
 
 def _try_match_reduce(uops):
@@ -1102,20 +1107,17 @@ class RkRenderer(ClangJITRenderer):
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
       if len(ptr_indices) == 3:
         i_out, i_A, i_B = ptr_indices[0], ptr_indices[1], ptr_indices[2]
-        Bh, M, K, N, fn = bmm['Bh'], bmm['M'], bmm['K'], bmm['N'], bmm['fn']
-        ob, ab, bb = bmm['bs_out'] * 2, bmm['bs_a'] * 2, bmm['bs_b'] * 2   # per-slice byte strides (fp16)
-        def slice_call(idx):   # one npu_matmul over slice `idx` at pointer offsets
-          return (f"{fn}(npu_fd, "
-            f"(void*)((char*){bufs[i_out][0]} + (long long)({idx})*{ob}), dma_{i_out} + (unsigned long long)({idx})*{ob}, obj_{i_out}, "
-            f"(const void*)((char*){bufs[i_A][0]} + (long long)({idx})*{ab}), dma_{i_A} + (unsigned long long)({idx})*{ab}, "
-            f"(const void*)((char*){bufs[i_B][0]} + (long long)({idx})*{bb}), dma_{i_B} + (unsigned long long)({idx})*{bb}, "
-            f"{M}, {K}, {N}, 0, 0.0f, (const float*)0)")
-        # Serial C loop over the Bh slices, run exactly once (force threads=1). The tempting
-        # alternative — let tinygrad spawn Bh threads (core_id = slice) so the driver spreads them
-        # across the 3 cores — FAILS: npu_matmul_fp16 shares non-thread-safe state (DMA pool, weight
-        # cache, regcmd scratch), so concurrent calls on one fd corrupt it ("SUBMIT FAILED: Invalid
-        # argument"). Real multicore needs a per-thread/reentrant C runtime first (see memory note).
-        body = [f"  for (int _b = 0; _b < {Bh}; _b++) {{ {slice_call('_b')}; }}"]
+        Bh, M, K, N = bmm['Bh'], bmm['M'], bmm['K'], bmm['N']
+        weight_t = 1 if bmm['layout'] == 'nk' else 0   # nk (q@kᵀ) -> pre-transposed pack
+        # One call into npu_matmul_fp16_batched: it builds all Bh*tiles and submits them in a single
+        # chained, multicore ioctl (the slices are contiguous, base ptr + internal s*M*K/K*N/M*N
+        # offsets). Force threads=1 (the whole batch is one C call). The earlier serial-loop and the
+        # tinygrad-thread multicore are both superseded — see the batched-matmul-recovery memory note.
+        body = [f"  npu_matmul_fp16_batched(npu_fd, "
+                f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
+                f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
+                f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
+                f"{Bh}, {M}, {K}, {N}, {weight_t}, 0);"]
         self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
@@ -1293,6 +1295,7 @@ class RkRenderer(ClangJITRenderer):
       'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
+      'void npu_matmul_fp16_batched(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int batch, int M, int K, int N, int weight_t, int relu);',
       'void npu_conv_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *feat_va, unsigned long long feat_dma, const void *weight_va, unsigned long long weight_dma, int N, int Cin, int IH, int IW, int Cout, int KH, int KW, int sh, int sw, int fp16_out);',
       'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
