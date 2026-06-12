@@ -711,7 +711,7 @@ def _try_match_batched_matmul(uops):
     return None
 
   if dbg: print(f"[bmm-match] Bh={Bh} M={M} K={K} N={N} fn={fn} layout={layout} "
-                f"(strides out={so[br]} a={sa[br]} b={sb[br]})")
+                f"(batch strides out={[so[r] for r in batch_r]} a={[sa[r] for r in batch_r]} b={[sb[r] for r in batch_r]})")
   return {'Bh': Bh, 'M': M, 'K': K, 'N': N, 'fn': fn, 'layout': layout,
           'bs_out': M * N, 'bs_a': M * K, 'bs_b': K * N}
 
