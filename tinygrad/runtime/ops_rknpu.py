@@ -700,9 +700,14 @@ def _try_match_batched_matmul(uops):
   if data_banks_avail < 1 or Mt_floor * K_pad * elem_bytes > data_banks_avail * CBUF_BANK:
     return None
 
-  if dbg: print(f"[bmm-match] Bh={Bh} M={M} K={K} N={N} fn={fn} layout={layout} "
+  # Multicore-emittable iff the batch is exactly ONE core_id DEFINE_VAR (so tinygrad's global_size
+  # == Bh and thread tid maps 1:1 to slice tid). Then render can spread the Bh slices across the 3
+  # cores instead of a serial C loop. Mixed batches (a RANGE, or B>1 = RANGE x core_id) keep the loop.
+  multicore = (len(batch_r) == 1 and batch_r[0].op is Ops.DEFINE_VAR
+               and isinstance(batch_r[0].arg, tuple) and batch_r[0].arg[0] == 'core_id')
+  if dbg: print(f"[bmm-match] Bh={Bh} M={M} K={K} N={N} fn={fn} layout={layout} multicore={multicore} "
                 f"(strides out={so[br]} a={sa[br]} b={sb[br]})")
-  return {'Bh': Bh, 'M': M, 'K': K, 'N': N, 'fn': fn, 'layout': layout,
+  return {'Bh': Bh, 'M': M, 'K': K, 'N': N, 'fn': fn, 'layout': layout, 'multicore': multicore,
           'bs_out': M * N, 'bs_a': M * K, 'bs_b': K * N}
 
 def _try_match_reduce(uops):
@@ -1083,6 +1088,36 @@ class RkRenderer(ClangJITRenderer):
     # size-factor it into a bogus matmul (silent wrong results). Correctness over coverage.
     if _conv_signature(uops):
       return super().render(uops)
+
+    # *** Batched matmul fast path (attention q@kᵀ / attn@v, [B,H,T,·]) ***
+    # The 2D matcher rejects these (a batch dim inflates the size factorization so isqrt(K²) fails).
+    # _try_match_batched_matmul recovers (Bh,M,K,N,layout); each batch slice is contiguous, so emit a
+    # C loop over the Bh slices, one npu_matmul_fp16(_bt) call each at a pointer offset. Force
+    # threads=1 (add to _npu_kernel_names) so the loop runs exactly once and covers every slice.
+    # (Multicore distribution is deferred: the batch is already mapped to core_id, but a serial loop
+    # is the correct v1 — see the batched-matmul-recovery memory note.)
+    bmm = _try_match_batched_matmul(uops)
+    if bmm is not None:
+      name, _kernel, bufs = self._render(uops)
+      ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
+      if len(ptr_indices) == 3:
+        i_out, i_A, i_B = ptr_indices[0], ptr_indices[1], ptr_indices[2]
+        Bh, M, K, N, fn = bmm['Bh'], bmm['M'], bmm['K'], bmm['N'], bmm['fn']
+        ob, ab, bb = bmm['bs_out'] * 2, bmm['bs_a'] * 2, bmm['bs_b'] * 2   # per-slice byte strides (fp16)
+        def slice_call(idx):   # one npu_matmul over slice `idx` at pointer offsets
+          return (f"{fn}(npu_fd, "
+            f"(void*)((char*){bufs[i_out][0]} + (long long)({idx})*{ob}), dma_{i_out} + (unsigned long long)({idx})*{ob}, obj_{i_out}, "
+            f"(const void*)((char*){bufs[i_A][0]} + (long long)({idx})*{ab}), dma_{i_A} + (unsigned long long)({idx})*{ab}, "
+            f"(const void*)((char*){bufs[i_B][0]} + (long long)({idx})*{bb}), dma_{i_B} + (unsigned long long)({idx})*{bb}, "
+            f"{M}, {K}, {N}, 0, 0.0f, (const float*)0)")
+        # Serial C loop over the Bh slices, run exactly once (force threads=1). The tempting
+        # alternative — let tinygrad spawn Bh threads (core_id = slice) so the driver spreads them
+        # across the 3 cores — FAILS: npu_matmul_fp16 shares non-thread-safe state (DMA pool, weight
+        # cache, regcmd scratch), so concurrent calls on one fd corrupt it ("SUBMIT FAILED: Invalid
+        # argument"). Real multicore needs a per-thread/reentrant C runtime first (see memory note).
+        body = [f"  for (int _b = 0; _b < {Bh}; _b++) {{ {slice_call('_b')}; }}"]
+        self._npu_kernel_names.add(_strip_ansi(name))
+        return self.render_kernel(name, body, bufs, uops)
 
     # *** Matmul fast path ***
     # tinygrad lowers `a @ b` to a reduce-loop kernel named "r_M_N_K" (with ANSI color codes).
