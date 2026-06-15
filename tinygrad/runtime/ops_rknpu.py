@@ -174,6 +174,11 @@ _lib.npu_div.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64,
 _lib.mem_destroy.restype = None
 _lib.mem_destroy.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64]
 
+# void mm_wcache_drop(int fd, const void *b_va) — invalidate the matmul packed-weight cache for a
+# weight VA when its buffer is freed (the cache keys on b_va, which the allocator recycles).
+_lib.mm_wcache_drop.restype = None
+_lib.mm_wcache_drop.argtypes = [ctypes.c_int, ctypes.c_void_p]
+
 
 def _mem_allocate(fd: int, size: int, flags: int = 0):
   """Allocate DMA memory via rk3588-npu. Returns (va_addr, dma_addr, obj_addr, handle)."""
@@ -204,10 +209,14 @@ class _rknpu_mem_sync(ctypes.Structure):
               ("obj_addr", ctypes.c_uint64), ("offset", ctypes.c_uint64), ("size", ctypes.c_uint64)]
 
 def _mem_sync(fd: int, obj_addr: int, size: int, flags: int):
-  """Cache maintenance for a CACHEABLE DMA buffer. No-op-safe: only call on cacheable allocs
-  (returns EINVAL on write-combine). Required because the NPU DMAs around the CPU cache."""
+  """Cache maintenance for a CACHEABLE DMA buffer. No-op-safe: only meaningful on cacheable allocs
+  (the kernel returns EINVAL on write-combine/uncached memory, which we swallow — uncached memory
+  needs no maintenance). Required because the NPU DMAs around the CPU cache."""
   import fcntl
-  fcntl.ioctl(fd, _RKNPU_MEM_SYNC, _rknpu_mem_sync(flags=flags, obj_addr=obj_addr, offset=0, size=size))
+  try:
+    fcntl.ioctl(fd, _RKNPU_MEM_SYNC, _rknpu_mem_sync(flags=flags, obj_addr=obj_addr, offset=0, size=size))
+  except OSError as e:
+    if e.errno != 22: raise   # EINVAL == uncached buffer -> coherent already, nothing to do
 
 
 # *** RKNPU Allocator ***
@@ -223,12 +232,18 @@ class RKNPUAllocator(HCQAllocator):
     # CACHEABLE (not WRITE_COMBINE): CPU reads from cached memory are ~9x faster (12 vs 1.4 GB/s),
     # which dominates copy-out. Cost: the NPU DMAs around the CPU cache, so _copyin must flush
     # (TO_DEVICE) and _copyout/_as_buffer must invalidate (FROM_DEVICE) — see _mem_sync.
-    va, dma_addr, obj_addr, handle = _mem_allocate(self.dev.fd, aligned_size, flags=19)
+    va, dma_addr, obj_addr, handle = _mem_allocate(self.dev.fd, aligned_size, flags=int(os.environ.get('RKNPU_ALLOC_FLAGS', '19')))
+    # Register VA -> (dma, obj) so kernels can resolve dma from the (graph-patched) VA at exec time.
+    RKNPUDevice._register_dma(va, aligned_size, dma_addr, obj_addr)
     view = MMIOInterface(va, size, fmt='B')
     return HCQBuffer(va_addr=va, size=size, meta=(handle, obj_addr, dma_addr, aligned_size), view=view, owner=self.dev)
 
   def _do_free(self, buf: HCQBuffer, options: BufferSpec | None = None):
     handle, obj_addr, _dma_addr, aligned_size = buf.meta
+    RKNPUDevice._unregister_dma(buf.va_addr)
+    # Drop any stale packed-weight cache entry for this VA: the allocator recycles VAs, and the
+    # matmul weight cache keys on b_va, so a future weight at this VA must not hit old packed data.
+    _lib.mm_wcache_drop(self.dev.fd, ctypes.c_void_p(buf.va_addr))
     # munmap the userspace mapping before destroying the kernel object
     ctypes.cdll.LoadLibrary("libc.so.6").munmap(ctypes.c_void_p(buf.va_addr), ctypes.c_size_t(aligned_size))
     _mem_destroy(self.dev.fd, handle, obj_addr)
@@ -244,6 +259,11 @@ class RKNPUAllocator(HCQAllocator):
   # CACHEABLE (fast CPU reads), so cache maintenance brackets the CPU<->NPU handoff.
   def _copyin(self, dest: HCQBuffer, src: memoryview):
     self.dev.synchronize()
+    # New host content into this VA invalidates any packed-weight cached from its OLD content.
+    # The allocator POOLS and reuses VAs (a freed weight's buffer is handed to a different tensor
+    # without _do_free), so copyin — not free — is where a VA's content actually changes. Without
+    # this, a matmul on the reused VA hits the previous weight's packed tiles -> silent wrong result.
+    _lib.mm_wcache_drop(self.dev.fd, ctypes.c_void_p(dest.va_addr))
     with cpu_profile(f'TINY -> {self.dev.device}', f"{self.dev.device}:COPY"): ctypes.memmove(int(dest.va_addr), from_mv(src), len(src))
     _mem_sync(self.dev.fd, dest.meta[1], dest.meta[3], _MEM_SYNC_TO_DEVICE)  # flush: NPU reads DRAM
 
@@ -1053,6 +1073,13 @@ class RkRenderer(ClangJITRenderer):
     # op N times and serialize them on the NPU's per-core FIFO). RKNPUComputeQueue.exec
     # forces threads=1 for these. See _try_match_* / the EW fast path below.
     self._npu_kernel_names: set[str] = set()
+    # Subset that are DMA-domain (EW add/sub/mul/max/neg/div): they read inputs and write output
+    # via the DPU's DMA engine, NOT the CPU. The matmul/reduce/conv paths instead pack/unpack via
+    # the CPU. RKNPUComputeQueue._rknpu_exec brackets DMA-domain kernels with cache maintenance —
+    # flush CPU-produced inputs to DRAM before, invalidate the DMA-written output after — so chains
+    # crossing the CPU<->DMA boundary (matmul->residual-add, EW->rmsnorm) stay coherent. Cacheable
+    # DMA buffers with cache maintenance only at host copyin/copyout would otherwise read stale DRAM.
+    self._npu_dma_kernel_names: set[str] = set()
 
   def render(self, uops: list[UOp]) -> str:
     # *** Conv fast path ***
@@ -1248,6 +1275,7 @@ class RkRenderer(ClangJITRenderer):
         for i in ptr_indices[3:]:
           body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[0]}, dma_{i}, {n});")
       self._npu_kernel_names.add(_strip_ansi(name))
+      self._npu_dma_kernel_names.add(_strip_ansi(name))   # DMA-domain: needs cache-coherence bracketing
       return self.render_kernel(name, body, bufs, uops)
 
     return super().render(uops)
@@ -1348,14 +1376,57 @@ class RKNPUProgram(CPUProgram):
 
 class RKNPUComputeQueue(CPUComputeQueue):
   def _rknpu_exec(self, tid, prg, dev_fd, bufs, n_dma, *args):
-    """Execute kernel with VA pointers, DMA/OBJ addresses, and device fd."""
+    """Execute kernel with VA pointers, DMA/OBJ addresses, and device fd.
+
+    DMA/OBJ are resolved from each (possibly graph-patched) VA at exec time via the device
+    registry — the baked dma_args (args[bufs:bufs+n_dma]) are IGNORED. Under HCQGraph the input
+    buffers are fake (meta=None -> baked dma 0), but their VA is variable-patched at submit, so
+    resolving from the live VA is correct for both eager and graph. Eager behaviour is unchanged
+    (resolve returns the same dma the buffer was allocated with)."""
     import platform
-    va_args = list(map(ctypes.c_uint64, args[:bufs]))
-    dma_args = list(map(ctypes.c_uint64, args[bufs:bufs+n_dma]))
+    raw_va = args[:bufs]
     vals = list(args[bufs+n_dma:])
+    dma_pairs = [RKNPUDevice.resolve_dma(int(v)) for v in raw_va]
+    # Fail-safe: an NPU fast-path kernel that would DMA to address 0 is an out-of-bounds access
+    # that wedges the SoC (no watchdog). Refuse to submit and raise instead — the worker captures
+    # this into dev.error_state and it surfaces at the next timeline wait. Set
+    # RKNPU_UNSAFE_ALLOW_ZERO_DMA=1 only to deliberately bypass this tripwire.
+    is_npu = _strip_ansi(prg.name) in getattr(prg.dev.renderer, "_npu_kernel_names", ())
+    if is_npu and not os.environ.get('RKNPU_UNSAFE_ALLOW_ZERO_DMA') and any(d == 0 for d, _o in dma_pairs):
+      bad = [i for i, (d, _o) in enumerate(dma_pairs) if d == 0]
+      raise RuntimeError(f"RKNPU refusing to submit NPU kernel {_strip_ansi(prg.name)!r}: "
+                         f"buffer(s) {bad} resolved to dma_addr=0 (unmapped VA). "
+                         f"VAs={[hex(int(v)) for v in raw_va]}")
+    if os.environ.get('RKNPU_JIT_DEBUG') == '1':
+      print(f"[rknpu-exec] {_strip_ansi(prg.name)} npu={is_npu} "
+            f"va={[hex(int(v)) for v in raw_va]} dma={[hex(d) for d, _ in dma_pairs]}")
+    va_args = list(map(ctypes.c_uint64, raw_va))
+    dma_args = []
+    for d, o in dma_pairs: dma_args += [ctypes.c_uint64(d), ctypes.c_uint64(o)]
     if 'core_id' in prg.runtimevars: vals[prg.runtimevars['core_id']] = tid
     vals_mapped = list(map(ctypes.c_int64 if platform.machine() == "arm64" else ctypes.c_int32, vals))
+    # DMA-domain (EW add/sub/mul/max/neg/div) ops read/write via the DPU DMA engine. Bracket with
+    # cache maintenance so they interoperate with CPU-domain producers/consumers (matmul pack/unpack,
+    # CPU kernels like sigmoid/rmsnorm). ptr 0 = output, ptr 1.. = inputs (the EW fast path emits dst
+    # first). flush-inputs covers CPU-kernel->EW (e.g. SiLU `sigmoid(h1)*h1`); invalidate-output
+    # covers EW->CPU/matmul. NOTE: this is BEST-EFFORT, not a complete coherence model — flushing a
+    # DMA-produced input whose CPU cacheline is stale could clobber fresh DRAM, and not every
+    # CPU<->DMA boundary in an arbitrary graph is covered. For guaranteed coherence on a complex
+    # graph, run with RKNPU_ALLOC_FLAGS=17 (uncached) — slower CPU reads, but no maintenance needed.
+    is_dma = _strip_ansi(prg.name) in getattr(prg.dev.renderer, "_npu_dma_kernel_names", ())
+    if is_dma:
+      for v in raw_va[1:]:                                        # flush CPU-produced inputs -> DRAM
+        o, sz = RKNPUDevice.resolve_obj_size(int(v))
+        if o: _mem_sync(dev_fd, o, sz, _MEM_SYNC_TO_DEVICE)
+      # Invalidate the output BEFORE the DMA write: the buffer may be recycled from a CPU kernel and
+      # hold a DIRTY cacheline; that stale line can write back (evict) over the DMA result at any
+      # time -> nondeterministic corruption. Dropping it first guarantees no write-back races.
+      o, sz = RKNPUDevice.resolve_obj_size(int(raw_va[0]))
+      if o: _mem_sync(dev_fd, o, sz, _MEM_SYNC_FROM_DEVICE)
     prg.fxn(*va_args, *vals_mapped, *dma_args, ctypes.c_int(dev_fd))
+    if is_dma:
+      o, sz = RKNPUDevice.resolve_obj_size(int(raw_va[0]))   # invalidate again for CPU readers
+      if o: _mem_sync(dev_fd, o, sz, _MEM_SYNC_FROM_DEVICE)
 
   def exec(self, prg, args_state:HCQArgsState, global_size, local_size):
     # Extract DMA/OBJ from HCQBuffer.meta for each pointer buffer
@@ -1442,6 +1513,54 @@ class RKNPUDevice(HCQCompiled):
   _shared_fd: int = -1
   _fd_refcount: int = 0
   _fd_lock: threading.Lock = threading.Lock()
+
+  # *** VA -> (dma_addr, obj_addr) registry ***
+  # The RKNPU has a unified address space: every DMA buffer's (dma_addr, obj_addr) is a stable
+  # function of its CPU virtual address for the buffer's whole lifetime. We resolve dma/obj from
+  # the VA *at kernel-exec time* rather than baking them from buf.meta at build time. This is what
+  # makes graph replay (TinyJit / HCQGraph) correct: HCQGraph substitutes each graph-input buffer
+  # with a fake buffer (variable VA, meta=None), and only the VA gets variable-patched at submit —
+  # baked meta would be 0 -> the NPU would DMA to address 0 -> IOMMU fault -> SoC wedge. Resolving
+  # from the patched VA gives the real dma for both eager and graph paths. One fd / one address
+  # space, so the map is process-global (class-level).
+  _dma_map: dict = {}                       # va_base -> (size, dma_base, obj_addr)
+  _dma_map_lock: threading.Lock = threading.Lock()
+
+  @classmethod
+  def _register_dma(cls, va: int, size: int, dma: int, obj: int):
+    with cls._dma_map_lock: cls._dma_map[va] = (size, dma, obj)
+
+  @classmethod
+  def _unregister_dma(cls, va: int):
+    with cls._dma_map_lock: cls._dma_map.pop(va, None)
+
+  @classmethod
+  def resolve_obj_size(cls, va: int) -> tuple:
+    """Map a VA to (obj_addr, size) of its containing allocation, for cache-maintenance ioctls.
+    Returns (0, 0) for an unknown VA. Sub-buffer offsets flush the whole containing object (safe
+    superset)."""
+    if not va: return (0, 0)
+    ent = cls._dma_map.get(va)
+    if ent is not None: return (ent[2], ent[0])
+    with cls._dma_map_lock:
+      for base, (size, dma, obj) in cls._dma_map.items():
+        if base <= va < base + size: return (obj, size)
+    return (0, 0)
+
+  @classmethod
+  def resolve_dma(cls, va: int) -> tuple:
+    """Map a (possibly graph-patched) VA to (dma_addr, obj_addr). Exact base hit is the common
+    O(1) case; a miss falls back to an interval scan for sub-buffer offsets (dma is linear in the
+    offset, obj is the containing object). Returns (0, 0) for a VA that is not an RKNPU buffer —
+    matching the old meta=None behaviour for CPU-fallback kernels, and tripping the zero-dma guard
+    in _rknpu_exec for NPU kernels (fail-safe rather than wedge)."""
+    if not va: return (0, 0)
+    ent = cls._dma_map.get(va)
+    if ent is not None: return (ent[1], ent[2])
+    with cls._dma_map_lock:
+      for base, (size, dma, obj) in cls._dma_map.items():
+        if base <= va < base + size: return (dma + (va - base), obj)
+    return (0, 0)
 
   def __init__(self, device: str = ""):
     with RKNPUDevice._fd_lock:
