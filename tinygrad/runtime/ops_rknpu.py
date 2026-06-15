@@ -972,7 +972,15 @@ def _try_match_conv(uops):
                   for ky in range(KH):
                     row = b + ky * IW
                     for kx in range(KW): pred.add(row + kx)
-          if pred == actual:
+          # OH==OW==1 means the kernel spans the entire input (KH==IH, KW==IW, no spatial
+          # sliding) — that is a full-reduction GEMM, not a convolution, and routing it to
+          # npu_conv_fp16 mis-computes it (e.g. a plain M×K@K×N matmul whose K-contraction
+          # happens to factor as Cin·KH gives N=M images, Cout=N_matmul, OH=OW=1 -> garbage,
+          # the 400×64×8192 bug). A real conv reduces here only when it slides (OH>1 or OW>1);
+          # the matmul-equivalent case is left to _try_match_matmul. (_conv_signature won't
+          # block that fallthrough: a matmul's contraction coeff is <=16, not the >16 spatial
+          # channel stride it keys on.)
+          if pred == actual and not (OH == 1 and OW == 1):
             return dict(N=N, Cin=Cin, IH=IH, IW=IW, Cout=Cout, KH=KH, KW=KW,
                         OH=OH, OW=OW, sh=sh, sw=sw, multicore=has_dvar)
   return None
