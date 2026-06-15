@@ -527,6 +527,38 @@ def _try_match_matmul(uops):
   if data_banks_avail < 1: return None
   if Mt_floor * K_pad * elem_bytes > data_banks_avail * CBUF_BANK: return None
 
+  # PARAM1 (A) LAYOUT CHECK. npu_matmul_* reads its 1st operand as row-major contiguous [M,K]:
+  # element (m,k) at offset m*K + k, the contraction k being the innermost contiguous run. A
+  # permuted/strided A view (e.g. attention's `attn.transpose(1,2).reshape(B*T,D).matmul(wo)`, where
+  # the [B,H,T,Dh] base is reshaped through a transpose) has the SAME byte size M*K, so the size-based
+  # recovery can't see it — but its lowered load interleaves the K axis ABOVE the M stride, and the
+  # wrapper would read the bytes in the wrong order => SILENT garbage (the ~1.1 rel-err attention gap).
+  # Detect by the affine coeffs of A's INDEX: in true [M,K] every reduce(k)-range coeff sits BELOW
+  # every loop(m)-range coeff (k is the inner block, m strides over whole rows). If a reduce coeff
+  # reaches/exceeds a loop coeff (interleaved), or the index is non-affine, the layout isn't packed
+  # [M,K] -> reject to CPU (there is no _at transposed-A fast path; correctness beats the offload).
+  # core_id (multicore M-partition) is a DEFINE_VAR, not a RANGE -> treat as loop. Zero-coeff ranges
+  # (don't index A) are ignored; an empty reduce/loop set (M fully upcast, or M==1) can't prove a
+  # permute, so it is left to pass (mirrors the PARAM2 check's conservative default).
+  for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is params[1]]:
+    off  = ix.src[1]
+    rs   = [u for u in off.toposort() if u.op is Ops.RANGE]
+    dvar = [u for u in off.toposort() if u.op is Ops.DEFINE_VAR]
+    zero = {x: x.const_like(0) for x in rs + dvar}
+    base = off.substitute(zero).simplify()
+    a_red, a_loop, a_nonaff = [], [], (base.op is not Ops.CONST)
+    for x in rs + dvar:
+      z1 = dict(zero); z1[x] = x.const_like(1)
+      b = off.substitute(z1).simplify()
+      if b.op is not Ops.CONST: a_nonaff = True; continue
+      d = b.arg - base.arg
+      if d == 0: continue
+      (a_red if (x.op is Ops.RANGE and len(x.arg) > 1 and x.arg[-1] is AxisType.REDUCE) else a_loop).append(d)
+    if a_nonaff or (a_red and a_loop and max(a_red) >= min(a_loop)):
+      if dbg: print(f"[mm-match] reject: PARAM1 (A) not packed [M,K] "
+                    f"(reduce={sorted(a_red)} loop={sorted(a_loop)} nonaffine={a_nonaff}) -> CPU")
+      return None
+
   # PARAM2 (B) LAYOUT CHECK. npu_matmul_* tiles its 2nd operand assuming row-major [K,N] (it
   # transposes-while-tiling). A genuinely-transposed [N,K]-contiguous operand (e.g.
   # B.T.contiguous().realize(), or any materialized transposed weight) has identical byte size K*N,
