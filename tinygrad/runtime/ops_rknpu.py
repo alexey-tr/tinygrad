@@ -8,7 +8,7 @@ from tinygrad.device import BufferSpec
 from tinygrad.dtype import dtypes, PtrDType, DType
 from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat, AxisType
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HCQArgsState, MMIOInterface
-from tinygrad.runtime.ops_cpu import CPUSignal, CPUWorker, CPUComputeQueue, CPUProgram, _in_worker_task
+from tinygrad.runtime.ops_cpu import CPUSignal, CPUWorker, CPUComputeQueue, CPUProgram, CPUAllocator, _in_worker_task
 from tinygrad.renderer.cstyle import ClangJITRenderer
 from tinygrad.renderer.llvmir import CPULLVMRenderer
 from tinygrad.runtime.support.compiler_cpu import ClangJITCompiler
@@ -180,143 +180,36 @@ _lib.mm_wcache_drop.restype = None
 _lib.mm_wcache_drop.argtypes = [ctypes.c_int, ctypes.c_void_p]
 
 
-def _mem_allocate(fd: int, size: int, flags: int = 0):
-  """Allocate DMA memory via rk3588-npu. Returns (va_addr, dma_addr, obj_addr, handle)."""
-  dma_addr = ctypes.c_uint64(0)
-  obj_addr = ctypes.c_uint64(0)
-  handle   = ctypes.c_uint32(0)
-  va = _lib.mem_allocate(fd, size, ctypes.byref(dma_addr), ctypes.byref(obj_addr), flags, ctypes.byref(handle))
-  if va is None or va == 0:
-    raise MemoryError(f"mem_allocate failed for size={size}")
-  return int(va), int(dma_addr.value), int(obj_addr.value), int(handle.value)
-
-
-libc = ctypes.CDLL("libc.so.6")
-libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-libc.munmap.restype = ctypes.c_int
-
-def _mem_destroy(fd: int, handle: int, obj_addr: int):
-  """Free DMA memory allocated by mem_allocate."""
-  _lib.mem_destroy(fd, handle, obj_addr)
-
-
-# DRM_IOCTL_RKNPU_MEM_SYNC = DRM_IOWR(DRM_COMMAND_BASE+0x05, struct rknpu_mem_sync[32 bytes])
-_RKNPU_MEM_SYNC = 0xC0206445
-_MEM_SYNC_TO_DEVICE   = 1   # flush CPU cache -> DRAM (before NPU reads CPU-written input)
-_MEM_SYNC_FROM_DEVICE = 2   # invalidate CPU cache (before CPU reads NPU-written output)
-class _rknpu_mem_sync(ctypes.Structure):
-  _fields_ = [("flags", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
-              ("obj_addr", ctypes.c_uint64), ("offset", ctypes.c_uint64), ("size", ctypes.c_uint64)]
-
-def _mem_sync(fd: int, obj_addr: int, size: int, flags: int):
-  """Cache maintenance for a CACHEABLE DMA buffer. No-op-safe: only meaningful on cacheable allocs
-  (the kernel returns EINVAL on write-combine/uncached memory, which we swallow — uncached memory
-  needs no maintenance). Required because the NPU DMAs around the CPU cache."""
-  import fcntl
-  try:
-    fcntl.ioctl(fd, _RKNPU_MEM_SYNC, _rknpu_mem_sync(flags=flags, obj_addr=obj_addr, offset=0, size=size))
-  except OSError as e:
-    if e.errno != 22: raise   # EINVAL == uncached buffer -> coherent already, nothing to do
-
-
 # *** RKNPU Allocator ***
 
-class RKNPUAllocator(HCQAllocator):
+class RKNPUAllocator(CPUAllocator):
+  """RKNPU buffers are plain cached RAM, identical to the CPU backend's: matmul/conv/reduce pack from
+  the buffer VA into their own internal DMA scratch and unpack back (they ignore the caller dma) and
+  every other op runs on the CPU, so no DMA mapping or cache maintenance is ever needed. We therefore
+  reuse CPUAllocator's anonymous-mmap _alloc / _as_buffer / _map verbatim and add ONLY the RKNPU
+  weight-cache hook: the C matmul runtime caches packed weights keyed on the weight VA, and the
+  allocator recycles VAs, so the cache must be dropped when a VA's content changes (copyin) or the
+  buffer is freed. _copyin/_copyout are direct memmove (the base would route through a copy queue)."""
   def __init__(self, dev: RKNPUDevice):
-    super().__init__(dev, supports_copy_from_disk=False, supports_transfer=True)
+    HCQAllocator.__init__(self, dev, supports_copy_from_disk=False, supports_transfer=True)
 
-  def _alloc(self, size: int, options: BufferSpec) -> HCQBuffer:
-    # rknpu driver requires page-aligned size for mmap when using NON_CONTIGUOUS
-    aligned_size = (size + 4095) & ~4095
-    # RKNPU_MEM_NON_CONTIGUOUS | RKNPU_MEM_CACHEABLE | RKNPU_MEM_IOMMU = 1 | 2 | 16 = 19.
-    # CACHEABLE (not WRITE_COMBINE): CPU reads from cached memory are ~9x faster (12 vs 1.4 GB/s),
-    # which dominates copy-out. Cost: the NPU DMAs around the CPU cache, so _copyin must flush
-    # (TO_DEVICE) and _copyout/_as_buffer must invalidate (FROM_DEVICE) — see _mem_sync.
-    va, dma_addr, obj_addr, handle = _mem_allocate(self.dev.fd, aligned_size, flags=int(os.environ.get('RKNPU_ALLOC_FLAGS', '19')))
-    # Register VA -> (dma, obj) so kernels can resolve dma from the (graph-patched) VA at exec time.
-    RKNPUDevice._register_dma(va, aligned_size, dma_addr, obj_addr)
-    view = MMIOInterface(va, size, fmt='B')
-    return HCQBuffer(va_addr=va, size=size, meta=(handle, obj_addr, dma_addr, aligned_size), view=view, owner=self.dev)
-
-  def _do_free(self, buf: HCQBuffer, options: BufferSpec | None = None):
-    handle, obj_addr, _dma_addr, aligned_size = buf.meta
-    RKNPUDevice._unregister_dma(buf.va_addr)
-    # Drop any stale packed-weight cache entry for this VA: the allocator recycles VAs, and the
-    # matmul weight cache keys on b_va, so a future weight at this VA must not hit old packed data.
-    _lib.mm_wcache_drop(self.dev.fd, ctypes.c_void_p(buf.va_addr))
-    # munmap the userspace mapping before destroying the kernel object
-    ctypes.cdll.LoadLibrary("libc.so.6").munmap(ctypes.c_void_p(buf.va_addr), ctypes.c_size_t(aligned_size))
-    _mem_destroy(self.dev.fd, handle, obj_addr)
-
-  def _as_buffer(self, src: HCQBuffer) -> memoryview:
-    self.dev.synchronize()
-    _mem_sync(self.dev.fd, src.meta[1], src.meta[3], _MEM_SYNC_FROM_DEVICE)  # invalidate: NPU wrote DRAM
-    return to_mv(src.va_addr, src.size)
-
-  # Override _copyin/_copyout to use direct memmove. The base HCQAllocator would use hw_copy_queue_t
-  # (RKNPUCopyQueue), which runs npu_add_scalar and treats all data as fp16 — corrupting non-fp16 buffers.
-  # RKNPU memory is CPU-accessible (unified address space), so memmove works directly. Buffers are
-  # CACHEABLE (fast CPU reads), so cache maintenance brackets the CPU<->NPU handoff.
   def _copyin(self, dest: HCQBuffer, src: memoryview):
     self.dev.synchronize()
-    # New host content into this VA invalidates any packed-weight cached from its OLD content.
-    # The allocator POOLS and reuses VAs (a freed weight's buffer is handed to a different tensor
-    # without _do_free), so copyin — not free — is where a VA's content actually changes. Without
-    # this, a matmul on the reused VA hits the previous weight's packed tiles -> silent wrong result.
+    # VAs are pooled/recycled, so copyin — not free — is where a VA's content actually changes; drop
+    # any packed-weight tiles cached from the OLD content or a matmul on this VA would reuse them.
     _lib.mm_wcache_drop(self.dev.fd, ctypes.c_void_p(dest.va_addr))
     with cpu_profile(f'TINY -> {self.dev.device}', f"{self.dev.device}:COPY"): ctypes.memmove(int(dest.va_addr), from_mv(src), len(src))
-    _mem_sync(self.dev.fd, dest.meta[1], dest.meta[3], _MEM_SYNC_TO_DEVICE)  # flush: NPU reads DRAM
 
   def _copyout(self, dest: memoryview, src: HCQBuffer):
     self.dev.synchronize()
-    _mem_sync(self.dev.fd, src.meta[1], src.meta[3], _MEM_SYNC_FROM_DEVICE)  # invalidate: NPU wrote DRAM
     with cpu_profile(f'{self.dev.device} -> TINY', f"{self.dev.device}:COPY"): ctypes.memmove(from_mv(dest), int(src.va_addr), len(dest))
 
-  def _map(self, buf: HCQBuffer): return None  # unified address space, no extra mapping needed
+  def _do_free(self, buf: HCQBuffer, options: BufferSpec | None = None):
+    # meta is the Python mmap object from CPUAllocator._alloc; dropping the buffer unmaps it (GC).
+    _lib.mm_wcache_drop(self.dev.fd, ctypes.c_void_p(buf.va_addr))
 
 
 # *** RKNPU Renderer ***
-
-# NPU function names keyed by (op, dtype)
-_NPU_FN = {
-  (Ops.MUL, dtypes.half):  "npu_mul",
-  (Ops.ADD, dtypes.half):  "npu_add",
-  (Ops.SUB, dtypes.half):  "npu_sub",
-  (Ops.MAX, dtypes.half):  "npu_max",
-  (Ops.MUL, dtypes.int8):  "npu_mul_i8",
-  (Ops.ADD, dtypes.int8):  "npu_add_i8",
-  (Ops.SUB, dtypes.int8):  "npu_sub_i8",
-  (Ops.MAX, dtypes.int8):  "npu_max_i8",
-  (Ops.MUL, dtypes.int16): "npu_mul_i16",
-  (Ops.ADD, dtypes.int16): "npu_add_i16",
-  (Ops.SUB, dtypes.int16): "npu_sub_i16",
-  (Ops.MAX, dtypes.int16): "npu_max_i16",
-  (Ops.MUL, dtypes.bfloat16): "npu_mul_bf16",
-  (Ops.ADD, dtypes.bfloat16): "npu_add_bf16",
-  (Ops.SUB, dtypes.bfloat16): "npu_sub_bf16",
-  (Ops.MAX, dtypes.bfloat16): "npu_max_bf16",
-}
-# Scalar variants (one operand is a constant). fp32 vector-vector and fp32 mul-scalar excluded:
-# - vector-vector: ERDMA 32-bit limitation
-# - mul-scalar:    DPU MUL EW path doesn't handle fp32 EW_OP_VALUE correctly (hangs)
-_NPU_FN_SCALAR = {
-  (Ops.MUL, dtypes.half):  "npu_mul_scalar",
-  (Ops.ADD, dtypes.half):  "npu_add_scalar",
-  (Ops.SUB, dtypes.half):  "npu_sub_scalar",
-  (Ops.MAX, dtypes.half):  "npu_max_scalar",
-  (Ops.ADD, dtypes.float): "npu_add_scalar_f32",
-  (Ops.SUB, dtypes.float): "npu_sub_scalar_f32",
-  (Ops.MUL, dtypes.int16): "npu_mul_scalar_i16",
-  (Ops.ADD, dtypes.int16): "npu_add_scalar_i16",
-  (Ops.SUB, dtypes.int16): "npu_sub_scalar_i16",
-  (Ops.MAX, dtypes.int16): "npu_max_scalar_i16",
-  (Ops.MUL, dtypes.bfloat16): "npu_mul_scalar_bf16",
-  (Ops.ADD, dtypes.bfloat16): "npu_add_scalar_bf16",
-  (Ops.SUB, dtypes.bfloat16): "npu_sub_scalar_bf16",
-  (Ops.MAX, dtypes.bfloat16): "npu_max_scalar_bf16",
-}
-_NPU_NEG = {dtypes.half: "npu_neg", dtypes.float: "npu_neg_f32", dtypes.int8: "npu_neg_i8", dtypes.int16: "npu_neg_i16",
-            dtypes.bfloat16: "npu_neg_bf16"}
 
 # Matmul auto-dispatch, keyed by (input dtype, output dtype). The int8 wrapper accumulates in a
 # wider type than its inputs (int8 x int8 -> int32), so output dtype differs from inputs — hence
@@ -337,6 +230,10 @@ _NPU_MATMUL = {
 # multiply-class ops that count as a matmul "product" (MULACC is fused multiply-add; absent in some
 # tinygrad versions, hence the guarded set).
 _MM_MUL_OPS = {Ops.MUL} | ({Ops.MULACC} if hasattr(Ops, 'MULACC') else set())
+# add-class ops that count as a matmul "accumulation" (summing the K products). MULACC also
+# accumulates. A matmul SUMS its products; an elementwise mul/div does not -> n_fadd distinguishes
+# them when the EW MULs are NOT pre-empted to CUSTOM (the RKNPU_RAM_BUFFERS path).
+_MM_ADD_OPS = {Ops.ADD} | ({Ops.MULACC} if hasattr(Ops, 'MULACC') else set())
 
 # Select/compare/transcendental float ops that a plain matmul accumulation NEVER emits (it is
 # only MUL/ADD over the K loop). Their presence means an elementwise EPILOGUE was fused onto the
@@ -468,16 +365,22 @@ def _try_match_matmul(uops):
   dbg = os.environ.get('NPU_MATMUL_DEBUG') == '1'
   if not any(u.op in (Ops.REDUCE_AXIS, Ops.RANGE) for u in uops):
     return None
-  # A real matmul contracts over K: it accumulates K products. The robust signature (verified by a
-  # probe across looped/unrolled matmuls vs every EW op) is a DEFINE_REG accumulator (looped K) OR
-  # >= 2 float/half MULTIPLIES (unrolled K => K product terms). A perfect-square-length elementwise
-  # op (out=p1=p2 => M=N=K=sqrt) factors to the SAME PARAM sizes but has no accumulation — without
-  # this guard it silently runs as a fake NxNxN matmul (e.g. (64,64) EW mul -> 4096=64^2 -> bogus
-  # 64x64x64 matmul, wrong results). NOTE: do NOT key on float ADD — `a - b` lowers to
-  # ADD(a, MUL(b,-1)), a single non-accumulating add that would wrongly pass; multiplies don't lie
-  # (mul/add/max rewrite to CUSTOM => 0 float MULs; sub has exactly 1).
+  # A real matmul contracts over K: it accumulates K products. A perfect-square-length elementwise op
+  # (out=p1=p2 => M=N=K=sqrt) factors to the SAME PARAM sizes, so we MUST distinguish by structure:
+  #   - looped K  -> a DEFINE_REG accumulator and/or a REDUCE-typed RANGE
+  #   - unrolled K -> the K products are SUMMED (an ADD tree: n_fadd>=1 alongside n_fmul>=2)
+  # An elementwise mul/div has multiple MULs (one per upcast lane) but NEVER sums them (n_fadd==0),
+  # so it is rejected. NOTE: keying on n_fmul>=2 ALONE is not enough once EW ops are NOT pre-empted
+  # to CUSTOM (the RKNPU_RAM_BUFFERS path): a square EW mul has n_fmul==upcast>=2 and would wrongly
+  # run as a fake NxNxN matmul (e.g. (16,16) EW mul -> 256=16^2 -> bogus 16x16x16 matmul via the _bt
+  # path, garbage out). Requiring summation (DEFINE_REG | reduce-range | adds) closes that. (Pairing
+  # n_fmul>=2 WITH n_fadd>=1 is safe: `a-b` => ADD(a,MUL(b,-1)) has n_fmul<2; multi-input fused EW
+  # like (a*b)+(c*d) is already rejected by the 3/4-PARAM count below.)
   n_fmul = sum(1 for u in uops if u.op in _MM_MUL_OPS and u.dtype.scalar() in (dtypes.float, dtypes.half))
-  if not (any(u.op is Ops.DEFINE_REG for u in uops) or n_fmul >= 2):
+  n_fadd = sum(1 for u in uops if u.op in _MM_ADD_OPS and u.dtype.scalar() in (dtypes.float, dtypes.half))
+  has_reduce_range = any(u.op is Ops.RANGE and isinstance(u.arg, tuple) and len(u.arg) > 1
+                         and u.arg[-1] is AxisType.REDUCE for u in uops)
+  if not (any(u.op is Ops.DEFINE_REG for u in uops) or has_reduce_range or (n_fmul >= 2 and n_fadd >= 1)):
     if dbg: print("[mm-match] reject: no K-accumulation (elementwise kernel?)")
     return None
   # Classify any fused elementwise epilogue: plain matmul, fused ReLU (DPU BS stage), or an
@@ -632,9 +535,7 @@ def _try_match_batched_matmul(uops):
     batch -> out & A & B   |   M -> out & A   |   N -> out & B   |   K(reduce) -> A & B (often unrolled)
   - Accumulation guard: require >=1 range that indexes EXACTLY 2 of the 3 PARAMs (an M/N/K range).
     A batched element-wise `A*B` has every range indexing all 3 (C[i]=A[i]*B[i]) -> no 2-of-3 range
-    -> rejected. This replaces the 2D matcher's MUL-count guard, which is unreliable here because
-    `rknpu_pm` rewrites the unrolled inner products `half*half` into CUSTOM 'npu_mul' nodes (so
-    n_fmul reads 0); see the memory note.
+    -> rejected. This range-based check is more robust here than the 2D matcher's MUL-count guard.
   - Contiguity cross-check (the safety guard against mis-recovery -> silent corruption): the batch
     axes must densely, nestedly tile each buffer with the per-slice block (M·N / M·K / K·N) as the
     innermost unit. Mismatch -> reject.
@@ -1009,117 +910,24 @@ def _conv_signature(uops):
       if b.op is Ops.CONST and (b.arg - base.arg) > 16: return True
   return False
 
-# Post-devectorization shape: GEP(LOAD(CAST(INDEX(PARAM, ...))))
-_param_gep = UPat(Ops.GEP, src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),))
-_const_fp16 = UPat(Ops.CONST, dtype=dtypes.half, name="c")
-_const_fp32 = UPat(Ops.CONST, dtype=dtypes.float, name="c")
-_const_i16  = UPat(Ops.CONST, dtype=dtypes.int16, name="c")
-_const_bf16 = UPat(Ops.CONST, dtype=dtypes.bfloat16, name="c")
-
-def _is_mul_neg1(m):
-  """True if m is the CUSTOM npu_mul_scalar(x, -1.0) that tinygrad emits for the `-b` in `a - b`.
-  (tinygrad lowers SUB to ADD(a, b*(-1)) before this pre-matcher runs, and the inner b*(-1) is
-  itself rewritten to npu_mul_scalar by the vector-OP-scalar rule above.)"""
-  return (m.op is Ops.CUSTOM and m.arg in ("npu_mul_scalar", "npu_mul_scalar_bf16", "npu_mul_scalar_i16")
-          and len(m.src) == 2 and m.src[1].op is Ops.CONST and float(m.src[1].arg) == -1.0)
-
-# Pre-matcher: tag fp16/fp32/int8 ALU ops whose operands trace to PARAM loads.
-rknpu_pm = PatternMatcher([
-  # fp16: vector OP vector
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.half, name="u", src=(_param_gep, _param_gep)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[(u.op, u.dtype)])),
-  # fp16: vector OP scalar  (note: `scalar - vector` is canonicalized by tinygrad to `v*(-1)+scalar`)
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.half, name="u", src=(_param_gep, _const_fp16)),
-   lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[(u.op, u.dtype)])),
-  # fp16: unary negate
-  (UPat(Ops.NEG, dtype=dtypes.half, name="u", src=(_param_gep,)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
-  # fp16: recover vector-vector subtract. `a - b` arrives as ADD(a, npu_mul_scalar(b, -1)) — see
-  # _is_mul_neg1 — so fold it back into a single npu_sub(a, b). Both ADD operand orders (commutative).
-  (UPat(Ops.ADD, dtype=dtypes.half, name="u", src=(_param_gep, UPat(Ops.CUSTOM, name="m"))),
-   lambda u, m: UOp(Ops.CUSTOM, u.dtype, (u.src[0], m.src[0]), _NPU_FN[(Ops.SUB, dtypes.half)]) if _is_mul_neg1(m) else None),
-  (UPat(Ops.ADD, dtype=dtypes.half, name="u", src=(UPat(Ops.CUSTOM, name="m"), _param_gep)),
-   lambda u, m: UOp(Ops.CUSTOM, u.dtype, (u.src[1], m.src[0]), _NPU_FN[(Ops.SUB, dtypes.half)]) if _is_mul_neg1(m) else None),
-  # fp32: ADD/SUB scalar only (MUL scalar hangs; vector-vector broken due to ERDMA 32-bit limit)
-  (UPat((Ops.ADD, Ops.SUB), dtype=dtypes.float, name="u", src=(_param_gep, _const_fp32)),
-   lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[(u.op, u.dtype)])),
-  # fp32: unary negate
-  (UPat(Ops.NEG, dtype=dtypes.float, name="u", src=(_param_gep,)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
-  # int8: vector OP vector
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.int8, name="u", src=(_param_gep, _param_gep)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[(u.op, u.dtype)])),
-  # int8: unary negate
-  (UPat(Ops.NEG, dtype=dtypes.int8, name="u", src=(_param_gep,)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
-  # int16: vector OP vector
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.int16, name="u", src=(_param_gep, _param_gep)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[(u.op, u.dtype)])),
-  # int16: vector OP scalar
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.int16, name="u", src=(_param_gep, _const_i16)),
-   lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[(u.op, u.dtype)])),
-  # int16: unary negate
-  (UPat(Ops.NEG, dtype=dtypes.int16, name="u", src=(_param_gep,)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
-  # bf16: vector OP vector. Note: the aarch64 clang backend on RK3588 cannot lower `__bf16 + __bf16`
-  # (the CPU is armv8.2-a; bf16 fadd needs armv8.6-a +bf16), so this CUSTOM only renders to valid C
-  # when the kernel hits the NPU fast path (`has_loops=False`) and the call becomes a single
-  # `npu_*_bf16(...)`. For looped kernels, tinygrad's emulation must take over instead, which it
-  # does because we leave `is_dtype_supported(bfloat16, RKNPU)=False` — that triggers
-  # `pm_dtype_decomps` to rewrite bf16 ops into ushort/bitshift form before this matcher fires.
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.bfloat16, name="u", src=(_param_gep, _param_gep)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_FN[(u.op, u.dtype)])),
-  # bf16: vector OP scalar
-  (UPat((Ops.MUL, Ops.ADD, Ops.SUB, Ops.MAX), dtype=dtypes.bfloat16, name="u", src=(_param_gep, _const_bf16)),
-   lambda u, c: UOp(Ops.CUSTOM, u.dtype, (u.src[0], c), _NPU_FN_SCALAR[(u.op, u.dtype)])),
-  # bf16: unary negate
-  (UPat(Ops.NEG, dtype=dtypes.bfloat16, name="u", src=(_param_gep,)),
-   lambda u: UOp(Ops.CUSTOM, u.dtype, u.src, _NPU_NEG[u.dtype])),
-  # fp16 divide: a / b lowers to MUL(gep_a, RECIPROCAL(gep_b)). Rewrite to npu_div(a, b).
-  (UPat(Ops.MUL, dtype=dtypes.half,
-        src=(UPat(Ops.GEP, name="ga", src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),)),
-             UPat(Ops.RECIPROCAL, dtype=dtypes.half,
-                  src=(UPat(Ops.GEP, name="gb", src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),)),)))),
-   lambda ga, gb: UOp(Ops.CUSTOM, dtypes.half, (ga, gb), "npu_div")),
-  (UPat(Ops.MUL, dtype=dtypes.half,
-        src=(UPat(Ops.RECIPROCAL, dtype=dtypes.half,
-                  src=(UPat(Ops.GEP, name="ga", src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),)),)),
-             UPat(Ops.GEP, name="gb", src=(UPat(Ops.LOAD, src=(UPat(Ops.CAST, src=(UPat(Ops.INDEX, src=(UPat(Ops.PARAM), UPat())),)),)),)))),
-   lambda ga, gb: UOp(Ops.CUSTOM, dtypes.half, (gb, ga), "npu_div")),
-])
-
-
 class RkCompiler(ClangJITCompiler):
   def compile(self, src:str) -> bytes:
     return self.compile_to_obj(src)
 
 class RkRenderer(ClangJITRenderer):
-  pre_matcher = rknpu_pm
-
-  string_rewrite = PatternMatcher([
-    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"({ctx[x.src[0]]} * {ctx[x.src[1]]})" if x.arg in ("npu_mul", "npu_mul_scalar", "npu_mul_f32", "npu_mul_scalar_f32", "npu_mul_i8", "npu_mul_i16", "npu_mul_scalar_i16", "npu_mul_bf16", "npu_mul_scalar_bf16") else None),
-    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"({ctx[x.src[0]]} + {ctx[x.src[1]]})" if x.arg in ("npu_add", "npu_add_scalar", "npu_add_f32", "npu_add_scalar_f32", "npu_add_i8", "npu_add_i16", "npu_add_scalar_i16", "npu_add_bf16", "npu_add_scalar_bf16") else None),
-    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"({ctx[x.src[0]]} - {ctx[x.src[1]]})" if x.arg in ("npu_sub", "npu_sub_scalar", "npu_sub_f32", "npu_sub_scalar_f32", "npu_sub_i8", "npu_sub_i16", "npu_sub_scalar_i16", "npu_sub_bf16", "npu_sub_scalar_bf16") else None),
-    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"(-{ctx[x.src[0]]})" if x.arg in ("npu_neg", "npu_neg_f32", "npu_neg_i8", "npu_neg_i16", "npu_neg_bf16") else None),
-    (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"(({ctx[x.src[0]]}) > ({ctx[x.src[1]]}) ? ({ctx[x.src[0]]}) : ({ctx[x.src[1]]}))" if x.arg in ("npu_max", "npu_max_scalar", "npu_max_i8", "npu_max_i16", "npu_max_scalar_i16", "npu_max_bf16", "npu_max_scalar_bf16") else None),
-  ]) + ClangJITRenderer.string_rewrite
+  # No pre_matcher: element-wise ops are NOT rewritten to npu_* CUSTOM nodes, so they render natively
+  # on the CPU via super().render() (EW-on-NPU needs the caller buffer to be DMA-mapped, which the
+  # RAM-only allocator no longer provides). Only matmul/conv/reduce go to the NPU — matched directly
+  # in render() (not via pre_matcher). bf16 EW decomposes via pm_dtype_decomps in codegen.
 
   def __init__(self, target: Target):
     super().__init__(target)
     self.compiler = RkCompiler()
-    # Names of kernels rendered via an NPU fast path. These call a single libhack
-    # npu_*() over the WHOLE buffer, so they must execute exactly once — NOT be
-    # data-parallel-split across global_size threads (which would re-submit the full
-    # op N times and serialize them on the NPU's per-core FIFO). RKNPUComputeQueue.exec
-    # forces threads=1 for these. See _try_match_* / the EW fast path below.
+    # Names of kernels rendered via an NPU fast path (matmul/conv/reduce). These call a single libhack
+    # npu_*() over the WHOLE buffer, so they must execute exactly once — NOT be data-parallel-split
+    # across global_size threads (which would re-submit the full op N times and serialize them on the
+    # NPU's per-core FIFO). RKNPUComputeQueue.exec forces threads=1 for these. See _try_match_*.
     self._npu_kernel_names: set[str] = set()
-    # Subset that are DMA-domain (EW add/sub/mul/max/neg/div): they read inputs and write output
-    # via the DPU's DMA engine, NOT the CPU. The matmul/reduce/conv paths instead pack/unpack via
-    # the CPU. RKNPUComputeQueue._rknpu_exec brackets DMA-domain kernels with cache maintenance —
-    # flush CPU-produced inputs to DRAM before, invalidate the DMA-written output after — so chains
-    # crossing the CPU<->DMA boundary (matmul->residual-add, EW->rmsnorm) stay coherent. Cacheable
-    # DMA buffers with cache maintenance only at host copyin/copyout would otherwise read stale DRAM.
-    self._npu_dma_kernel_names: set[str] = set()
 
   def render(self, uops: list[UOp]) -> str:
     # *** Conv fast path ***
@@ -1247,77 +1055,6 @@ class RkRenderer(ClangJITRenderer):
         self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
-    # rknpu_pm rewrites eligible fp16 ALU ops to CUSTOM nodes tagged with the NPU fn name.
-    # If any such node survived to render time, this is an NPU-accelerable kernel.
-    _all_npu_fns = set(_NPU_FN.values()) | set(_NPU_FN_SCALAR.values()) | set(_NPU_NEG.values()) | {"npu_div"}
-    npu_ops = [u for u in uops if u.op is Ops.CUSTOM and u.arg in _all_npu_fns]
-    # Guards against the pre-matcher having matched only a sub-expression of a complex kernel.
-    # The NPU dispatch only emits ONE function call and would silently drop unmatched compute.
-    # (1) Check pointer count: scalar/unary expects 2 ptrs, vector-vector expects 3 (or fewer
-    #     after in-place dedup). Extra ptrs mean unmatched inputs.
-    # (2) Check that no other float/half ALU ops remain — those would be dropped.
-    # (3) All CUSTOMs must share one NPU fn name — otherwise we'd need >1 NPU call but emit only 1.
-    # (4) Exactly one STORE — fused multi-output kernels would lose the other outputs.
-    # The loop is irrelevant: tinygrad's UPCAST vectorizes element-wise kernels into N copies of the
-    # same per-lane CUSTOM (e.g. 4 lanes × 64 iters for upcast-4-256). All copies invoke the same
-    # NPU op on the same buffer pair, so we bypass the loop and emit a single call that processes
-    # all elements; the NPU iterates internally.
-    _FLOAT_ALU = {Ops.ADD, Ops.SUB, Ops.MUL, Ops.NEG, Ops.MAX, Ops.WHERE, Ops.RECIPROCAL, Ops.SQRT,
-                  Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.TRUNC, Ops.CMPLT, Ops.CMPNE}
-    extra_float_alu = any(u.op in _FLOAT_ALU and u.dtype.scalar() in (dtypes.float, dtypes.half) for u in uops)
-    unique_npu_fns = {u.arg for u in npu_ops}
-    n_stores = sum(1 for u in uops if u.op is Ops.STORE)
-    if npu_ops and len(unique_npu_fns) == 1 and not extra_float_alu and n_stores == 1:
-      fn = next(iter(unique_npu_fns))
-      name, _kernel, bufs = self._render(uops)
-      ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
-      is_scalar_or_unary = fn in _NPU_FN_SCALAR.values() or fn in _NPU_NEG.values()
-      max_ptrs = 2 if is_scalar_or_unary else 3
-      if len(ptr_indices) > max_ptrs:
-        return super().render(uops)
-      params = [u for u in uops if u.op is Ops.PARAM]
-      n_elem = params[0].dtype.size
-      # The DPU writes one 16-byte-aligned pixel slot at a time, so the per-dtype channel
-      # count is 16/element_bytes: fp16/bf16=8, int8=16, fp32=4 (fp32 isn't acceleratable
-      # anyway). Buffers smaller than one full pixel force out-of-bounds DMA — fall back.
-      min_elem = 16 if fn.endswith('_i8') else 8
-      if n_elem < min_elem:
-        return super().render(uops)
-      n = str(n_elem)
-
-      body = []
-      # For in-place ops (e.g. x += 3), bufs may dedupe so dst and src share a single ptr_index
-      src_idx = ptr_indices[1] if len(ptr_indices) > 1 else ptr_indices[0]
-      if fn in _NPU_NEG.values():
-        # unary: fn(fd, dst_dma, dst_obj, src_dma, n)
-        body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{src_idx}, {n});")
-      elif fn in _NPU_FN_SCALAR.values():
-        # scalar: second src is a CONST — embed literal; only one pointer buffer besides dst
-        if fn.endswith('_i16'):
-          const_ops = [u for u in uops if u.op is Ops.CONST and u.dtype == dtypes.int16]
-          scalar_int = int(const_ops[0].arg) if const_ops else 0
-          scalar_cast = ""
-          scalar_str = f"(short){scalar_int}"
-        else:
-          is_f32 = fn.endswith('_f32')
-          is_bf16 = fn.endswith('_bf16')
-          const_dtype = dtypes.float if is_f32 else (dtypes.bfloat16 if is_bf16 else dtypes.half)
-          scalar_cast = "" if is_f32 else ("(__bf16)" if is_bf16 else "(__fp16)")
-          const_ops = [u for u in uops if u.op is Ops.CONST and u.dtype == const_dtype]
-          scalar_f = float(const_ops[0].arg) if const_ops else 0.0
-          if math.isinf(scalar_f): scalar_str = "-__builtin_inff()" if scalar_f < 0 else "__builtin_inff()"
-          elif math.isnan(scalar_f): scalar_str = '__builtin_nanf("")'
-          else: scalar_str = f"{scalar_f!r}f"
-        body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{src_idx}, {scalar_cast}{scalar_str}, {n});")
-      else:
-        # vector OP vector
-        body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[1]}, dma_{ptr_indices[2]}, {n});")
-        for i in ptr_indices[3:]:
-          body.append(f"  {fn}(npu_fd, dma_{ptr_indices[0]}, obj_{ptr_indices[0]}, dma_{ptr_indices[0]}, dma_{i}, {n});")
-      self._npu_kernel_names.add(_strip_ansi(name))
-      self._npu_dma_kernel_names.add(_strip_ansi(name))   # DMA-domain: needs cache-coherence bracketing
-      return self.render_kernel(name, body, bufs, uops)
-
     return super().render(uops)
 
   def _render_defines(self, uops) -> list[str]:
@@ -1416,76 +1153,35 @@ class RKNPUProgram(CPUProgram):
 
 class RKNPUComputeQueue(CPUComputeQueue):
   def _rknpu_exec(self, tid, prg, dev_fd, bufs, n_dma, *args):
-    """Execute kernel with VA pointers, DMA/OBJ addresses, and device fd.
-
-    DMA/OBJ are resolved from each (possibly graph-patched) VA at exec time via the device
-    registry — the baked dma_args (args[bufs:bufs+n_dma]) are IGNORED. Under HCQGraph the input
-    buffers are fake (meta=None -> baked dma 0), but their VA is variable-patched at submit, so
-    resolving from the live VA is correct for both eager and graph. Eager behaviour is unchanged
-    (resolve returns the same dma the buffer was allocated with)."""
+    """Run a kernel: VA pointers + zero dma args + device fd. tinygrad buffers are plain CPU RAM
+    (dma=0). matmul/conv/reduce ignore the dma arg (they pack from the VA into their own scratch) and
+    every other op runs on the CPU, so there is no dma to resolve and no cache maintenance to do. The
+    baked dma_args (args[bufs:bufs+n_dma]) are ignored; zero dma args are passed to match the C
+    signature. Under HCQGraph the VA is variable-patched at submit, which is all the C op needs."""
     import platform
     raw_va = args[:bufs]
     vals = list(args[bufs+n_dma:])
-    dma_pairs = [RKNPUDevice.resolve_dma(int(v)) for v in raw_va]
-    # Fail-safe: an NPU fast-path kernel that would DMA to address 0 is an out-of-bounds access
-    # that wedges the SoC (no watchdog). Refuse to submit and raise instead — the worker captures
-    # this into dev.error_state and it surfaces at the next timeline wait. Set
-    # RKNPU_UNSAFE_ALLOW_ZERO_DMA=1 only to deliberately bypass this tripwire.
-    is_npu = _strip_ansi(prg.name) in getattr(prg.dev.renderer, "_npu_kernel_names", ())
-    if is_npu and not os.environ.get('RKNPU_UNSAFE_ALLOW_ZERO_DMA') and any(d == 0 for d, _o in dma_pairs):
-      bad = [i for i, (d, _o) in enumerate(dma_pairs) if d == 0]
-      raise RuntimeError(f"RKNPU refusing to submit NPU kernel {_strip_ansi(prg.name)!r}: "
-                         f"buffer(s) {bad} resolved to dma_addr=0 (unmapped VA). "
-                         f"VAs={[hex(int(v)) for v in raw_va]}")
-    if os.environ.get('RKNPU_JIT_DEBUG') == '1':
-      print(f"[rknpu-exec] {_strip_ansi(prg.name)} npu={is_npu} "
-            f"va={[hex(int(v)) for v in raw_va]} dma={[hex(d) for d, _ in dma_pairs]}")
-    va_args = list(map(ctypes.c_uint64, raw_va))
-    dma_args = []
-    for d, o in dma_pairs: dma_args += [ctypes.c_uint64(d), ctypes.c_uint64(o)]
     if 'core_id' in prg.runtimevars: vals[prg.runtimevars['core_id']] = tid
+    va_args = list(map(ctypes.c_uint64, raw_va))
     vals_mapped = list(map(ctypes.c_int64 if platform.machine() == "arm64" else ctypes.c_int32, vals))
-    # DMA-domain (EW add/sub/mul/max/neg/div) ops read/write via the DPU DMA engine. Bracket with
-    # cache maintenance so they interoperate with CPU-domain producers/consumers (matmul pack/unpack,
-    # CPU kernels like sigmoid/rmsnorm). ptr 0 = output, ptr 1.. = inputs (the EW fast path emits dst
-    # first). flush-inputs covers CPU-kernel->EW (e.g. SiLU `sigmoid(h1)*h1`); invalidate-output
-    # covers EW->CPU/matmul. NOTE: this is BEST-EFFORT, not a complete coherence model — flushing a
-    # DMA-produced input whose CPU cacheline is stale could clobber fresh DRAM, and not every
-    # CPU<->DMA boundary in an arbitrary graph is covered. For guaranteed coherence on a complex
-    # graph, run with RKNPU_ALLOC_FLAGS=17 (uncached) — slower CPU reads, but no maintenance needed.
-    is_dma = _strip_ansi(prg.name) in getattr(prg.dev.renderer, "_npu_dma_kernel_names", ())
-    if is_dma:
-      for v in raw_va[1:]:                                        # flush CPU-produced inputs -> DRAM
-        o, sz = RKNPUDevice.resolve_obj_size(int(v))
-        if o: _mem_sync(dev_fd, o, sz, _MEM_SYNC_TO_DEVICE)
-      # Invalidate the output BEFORE the DMA write: the buffer may be recycled from a CPU kernel and
-      # hold a DIRTY cacheline; that stale line can write back (evict) over the DMA result at any
-      # time -> nondeterministic corruption. Dropping it first guarantees no write-back races.
-      o, sz = RKNPUDevice.resolve_obj_size(int(raw_va[0]))
-      if o: _mem_sync(dev_fd, o, sz, _MEM_SYNC_FROM_DEVICE)
-    prg.fxn(*va_args, *vals_mapped, *dma_args, ctypes.c_int(dev_fd))
-    if is_dma:
-      o, sz = RKNPUDevice.resolve_obj_size(int(raw_va[0]))   # invalidate again for CPU readers
-      if o: _mem_sync(dev_fd, o, sz, _MEM_SYNC_FROM_DEVICE)
+    prg.fxn(*va_args, *vals_mapped, *([ctypes.c_uint64(0)] * (2 * bufs)), ctypes.c_int(dev_fd))
+    # This kernel just wrote its output buffer (raw_va[0] = the STORE target, for any kernel — NPU
+    # matmul/conv/reduce or a CPU op like an in-place `W = W - lr*grad`). If that VA was a cached
+    # matmul weight, its packed copy is now stale, so drop it. With _copyin (host writes) and _do_free
+    # (release), this covers every way a buffer's bytes can change -> the weight cache stays sound.
+    if bufs: _lib.mm_wcache_drop(dev_fd, ctypes.c_void_p(int(raw_va[0])))
 
   def exec(self, prg, args_state:HCQArgsState, global_size, local_size):
-    # Extract DMA/OBJ from HCQBuffer.meta for each pointer buffer
-    dma_args = []
-    for buf in args_state.bufs:
-      if buf.meta is not None:
-        _handle, obj_addr, dma_addr, _size = buf.meta
-      else:
-        obj_addr, dma_addr = 0, 0
-      dma_args.extend([dma_addr, obj_addr])
     dev_fd = prg.dev.fd
-    # NPU fast-path kernels emit a single npu_*() over the whole buffer and must run ONCE.
-    # tinygrad may split an elementwise/matmul kernel into global_size>1 data-parallel threads;
-    # for an NPU kernel that re-submits the FULL op once per thread and serializes them on the
-    # NPU FIFO (≈N× slowdown + N concurrent submits on one fd). Force threads=1 for NPU kernels.
+    # No dma args: tinygrad buffers are plain RAM (dma=0) and the NPU op wrappers ignore the caller
+    # dma (they use the VA + their own scratch), so _rknpu_exec passes zero dma args itself (n_dma=0).
+    # NPU fast-path kernels (matmul/conv/reduce) emit a single npu_*() over the whole buffer and must
+    # run ONCE; tinygrad may split a kernel into global_size>1 data-parallel threads, which for an NPU
+    # kernel would re-submit the FULL op per thread and serialize on the NPU FIFO. Force threads=1.
     is_npu = _strip_ansi(prg.name) in getattr(prg.dev.renderer, "_npu_kernel_names", ())
     threads = 1 if is_npu else (global_size or (1,))[0]
-    return self.cmd(self._rknpu_exec, prg, dev_fd, len(args_state.bufs), len(dma_args),
-                    *[x.va_addr for x in args_state.bufs], *dma_args, *args_state.vals, threads=threads)
+    return self.cmd(self._rknpu_exec, prg, dev_fd, len(args_state.bufs), 0,
+                    *[x.va_addr for x in args_state.bufs], *args_state.vals, threads=threads)
 
 # Minimum byte size to use NPU for copy; below this threshold, memmove is faster
 _COPY_NPU_MIN_BYTES = 4096
@@ -1554,53 +1250,10 @@ class RKNPUDevice(HCQCompiled):
   _fd_refcount: int = 0
   _fd_lock: threading.Lock = threading.Lock()
 
-  # *** VA -> (dma_addr, obj_addr) registry ***
-  # The RKNPU has a unified address space: every DMA buffer's (dma_addr, obj_addr) is a stable
-  # function of its CPU virtual address for the buffer's whole lifetime. We resolve dma/obj from
-  # the VA *at kernel-exec time* rather than baking them from buf.meta at build time. This is what
-  # makes graph replay (TinyJit / HCQGraph) correct: HCQGraph substitutes each graph-input buffer
-  # with a fake buffer (variable VA, meta=None), and only the VA gets variable-patched at submit —
-  # baked meta would be 0 -> the NPU would DMA to address 0 -> IOMMU fault -> SoC wedge. Resolving
-  # from the patched VA gives the real dma for both eager and graph paths. One fd / one address
-  # space, so the map is process-global (class-level).
-  _dma_map: dict = {}                       # va_base -> (size, dma_base, obj_addr)
-  _dma_map_lock: threading.Lock = threading.Lock()
-
-  @classmethod
-  def _register_dma(cls, va: int, size: int, dma: int, obj: int):
-    with cls._dma_map_lock: cls._dma_map[va] = (size, dma, obj)
-
-  @classmethod
-  def _unregister_dma(cls, va: int):
-    with cls._dma_map_lock: cls._dma_map.pop(va, None)
-
-  @classmethod
-  def resolve_obj_size(cls, va: int) -> tuple:
-    """Map a VA to (obj_addr, size) of its containing allocation, for cache-maintenance ioctls.
-    Returns (0, 0) for an unknown VA. Sub-buffer offsets flush the whole containing object (safe
-    superset)."""
-    if not va: return (0, 0)
-    ent = cls._dma_map.get(va)
-    if ent is not None: return (ent[2], ent[0])
-    with cls._dma_map_lock:
-      for base, (size, dma, obj) in cls._dma_map.items():
-        if base <= va < base + size: return (obj, size)
-    return (0, 0)
-
-  @classmethod
-  def resolve_dma(cls, va: int) -> tuple:
-    """Map a (possibly graph-patched) VA to (dma_addr, obj_addr). Exact base hit is the common
-    O(1) case; a miss falls back to an interval scan for sub-buffer offsets (dma is linear in the
-    offset, obj is the containing object). Returns (0, 0) for a VA that is not an RKNPU buffer —
-    matching the old meta=None behaviour for CPU-fallback kernels, and tripping the zero-dma guard
-    in _rknpu_exec for NPU kernels (fail-safe rather than wedge)."""
-    if not va: return (0, 0)
-    ent = cls._dma_map.get(va)
-    if ent is not None: return (ent[1], ent[2])
-    with cls._dma_map_lock:
-      for base, (size, dma, obj) in cls._dma_map.items():
-        if base <= va < base + size: return (dma + (va - base), obj)
-    return (0, 0)
+  # No VA->dma registry: tinygrad buffers are plain CPU RAM (dma=0). The NPU op wrappers
+  # (matmul/conv/reduce) allocate their own DMA scratch internally and only read/write the caller
+  # buffer via its VA, so the device never needs to map a tinygrad VA to a dma address. Under
+  # HCQGraph the VA is variable-patched at submit, which is all the C ops consume.
 
   def __init__(self, device: str = ""):
     with RKNPUDevice._fd_lock:
