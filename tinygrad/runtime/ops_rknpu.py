@@ -118,7 +118,8 @@ _lib.npu_neg_bf16.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ct
 # per-channel bias are auto-dispatched (see _matmul_epilogue / _try_match_matmul); scalar `bias`
 # is ctypes-only (render passes 0.0) — a const-add epilogue can't be reliably told from the
 # matmul's own ADDs. pcbias is fp16-only in the runtime (bf16/int8 wrappers take but ignore it).
-for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8', 'npu_matmul_fp16_bt', 'npu_matmul_int8_bt']:
+for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8', 'npu_matmul_fp16_bt', 'npu_matmul_int8_bt',
+            'npu_matmul_fp16_silu']:
   getattr(_lib, _fn).restype = None
   getattr(_lib, _fn).argtypes = [ctypes.c_int,
                                  ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
@@ -257,8 +258,61 @@ def _where_is_relu(w):
 def _max_is_relu(m):
   return m.op is Ops.MAX and len(m.src) == 2 and (_is_zero_const(m.src[0]) or _is_zero_const(m.src[1]))
 
+_SILU_C = -1.4426950408889634   # -log2(e): the constant in sigmoid's exp2 (exp(-x) == exp2(-log2(e)*x))
+
+def _strip_cast(u):
+  while u.op in (Ops.CAST, Ops.GEP, Ops.BITCAST) and len(u.src) == 1: u = u.src[0]
+  return u
+
+def _is_silu_fdiv(fd):
+  """For an FDIV node: True if it is silu = x / (1 + exp2(-log2(e)*x)) with the numerator BEING the
+  accumulator x; False if it is the sigmoid shape 1/(1+exp2(..x)) (numerator is const 1.0, not x);
+  None if it isn't the sigmoid-denominator shape at all. The True-vs-False split is what distinguishes
+  silu from sigmoid — impossible by op histogram (they're identical). Requires native EXP2 (RkRenderer
+  keeps it in code_for_op) so the shape isn't a decomposed polynomial blob."""
+  if fd.op is not Ops.FDIV or len(fd.src) != 2: return None
+  num, den = fd.src
+  if den.op is not Ops.ADD or len(den.src) != 2: return None
+  ones = [s for s in den.src if s.op is Ops.CONST and abs(s.arg - 1.0) < 1e-6]
+  exps = [s for s in den.src if s.op is Ops.EXP2]
+  if len(ones) != 1 or len(exps) != 1: return None
+  mul = exps[0].src[0]
+  if mul.op is not Ops.MUL or len(mul.src) != 2: return None
+  cs = [s for s in mul.src if s.op is Ops.CONST and abs(s.arg - _SILU_C) < 1e-3]
+  xs = [s for s in mul.src if not (s.op is Ops.CONST and abs(s.arg - _SILU_C) < 1e-3)]
+  if len(cs) != 1 or len(xs) != 1: return None
+  return _strip_cast(num) is _strip_cast(xs[0])
+
+def _epilogue_is_silu(uops):
+  """True iff the kernel computes EXACTLY silu(accumulator). Two conditions:
+   1. EVERY FDIV is the silu shape x/(1+exp2(-log2(e)*x)) with numerator == the accumulator. This
+      rejects sigmoid (numerator is const 1.0) and gelu/tanh (FDIV numerator is exp2-1, not x).
+   2. Each silu FDIV's result flows ONLY to a STORE (through layout wrappers CAST/VECTORIZE/GEP/
+      BITCAST), never into another MUL/ADD/etc. This rejects silu*c / silu+c / f(silu) — they'd drop
+      the trailing op -> those correctly fall back to CPU.
+  SOUND: any deviation -> False. Validated against silu (accept) and plain/relu/sigmoid/gelu/tanh/
+  silu*2/silu+1 (reject)."""
+  fdivs = [u for u in uops if u.op is Ops.FDIV]
+  if not fdivs: return False
+  if any(_is_silu_fdiv(f) is not True for f in fdivs): return False
+  consumers = {}
+  for u in uops:
+    for s in u.src: consumers.setdefault(s, []).append(u)
+  WRAP = {Ops.CAST, Ops.VECTORIZE, Ops.GEP, Ops.BITCAST}
+  def flows_to_store_only(start):
+    stack, seen = [start], set()
+    while stack:
+      u = stack.pop()
+      for c in consumers.get(u, ()):
+        if c.op is Ops.STORE: continue
+        if c.op in WRAP:
+          if c not in seen: seen.add(c); stack.append(c)
+        else: return False                       # a non-wrapper op consumes the silu result -> not pure silu
+    return True
+  return all(flows_to_store_only(f) for f in fdivs)
+
 def _matmul_epilogue(uops):
-  """Classify the fused epilogue on a matmul kernel: 'plain', 'relu', or None.
+  """Classify the fused epilogue on a matmul kernel: 'plain', 'relu', 'silu', or None.
 
   None means a select/compare/transcendental epilogue is present that we can't fuse (sigmoid,
   gelu, tanh, exp, ...); the caller MUST fall back to CPU rather than run a plain matmul and
@@ -282,6 +336,10 @@ def _matmul_epilogue(uops):
   maxes  = [u for u in uops if u.op is Ops.MAX]
   if present <= {Ops.WHERE, Ops.CMPLT} and wheres and all(_where_is_relu(w) for w in wheres): return 'relu'
   if present == {Ops.MAX} and maxes and all(_max_is_relu(m) for m in maxes): return 'relu'
+  # silu = x*sigmoid(x): epilogue is just EXP2 (the sigmoid's exp) + an FDIV; structural check (NOT
+  # op-histogram — silu and sigmoid have identical histograms) confirms it's silu, not sigmoid/gelu.
+  # NPU_NO_SILU=1 disables the fused-silu dispatch (for A/B benchmarking) -> the fused kernel -> CPU.
+  if present <= {Ops.EXP2} and not os.environ.get('NPU_NO_SILU') and _epilogue_is_silu(uops): return 'silu'
   return None
 
 def _affine_offset(off):
@@ -512,7 +570,17 @@ def _try_match_matmul(uops):
       return None
     bias_pidx = params[3].arg
 
-  if dbg: print(f"[mm-match] M={M} K={K} N={N} relu={relu} bias={bias_pidx is not None} "
+  # SILU epilogue -> npu_matmul_fp16_silu (row-major matmul + on-NPU silu LUT fold + /5658 dequant,
+  # with a CPU fallback inside the wrapper for |a@b|>~11.5 where the fp16 silu*5658 intermediate would
+  # overflow). fp16 [K,N] only (the silu LUT is fp16; no _bt/int8/bf16 variant), no per-channel bias,
+  # and M*N % 8 == 0 (silu cube granularity). Anything else -> CPU (never silently miscompute).
+  if epi == 'silu':
+    if fn != 'npu_matmul_fp16' or bias_pidx is not None or (M * N) % 8 != 0:
+      if dbg: print("[mm-match] silu epilogue but unsupported (need fp16 [K,N], no bias, M*N%8==0) -> CPU")
+      return None
+    fn = 'npu_matmul_fp16_silu'
+
+  if dbg: print(f"[mm-match] M={M} K={K} N={N} relu={relu} silu={epi=='silu'} bias={bias_pidx is not None} "
                 f"(out={out_sz} p1={p1_sz} p2={p2_sz})")
   return (M, N, K, fn, relu, bias_pidx)
 
@@ -920,6 +988,17 @@ class RkRenderer(ClangJITRenderer):
   # RAM-only allocator no longer provides). Only matmul/conv/reduce go to the NPU — matched directly
   # in render() (not via pre_matcher). bf16 EW decomposes via pm_dtype_decomps in codegen.
 
+  # Keep EXP2 + RECIPROCAL NATIVE (ClangRenderer drops them -> they get decomposed to polynomials).
+  # With them native, transcendental activations lower to real Ops.EXP2 / Ops.RECIPROCAL uops, so the
+  # matmul matcher can PRECISELY identify silu = x*sigmoid(x) = MUL(acc, RECIPROCAL(ADD(1, EXP2(...))))
+  # and distinguish it from sigmoid (no outer MUL-by-acc) / gelu (tanh) — impossible when all three
+  # expand to byte-identical CMPLT/WHERE/SUB poly blobs. Mirrors DSPRenderer overriding SQRT; the
+  # __builtin_ form links with no libm dependency. (CPU-fallback exp/div now use the accurate builtin
+  # instead of the poly approximation — same or better numerics.)
+  code_for_op = {**ClangJITRenderer.code_for_op,
+                 Ops.EXP2: lambda x,dtype: f"__builtin_exp2({x})" if dtype == dtypes.float64 else f"__builtin_exp2f({x})",
+                 Ops.RECIPROCAL: lambda x,dtype: f"(1.0/{x})" if dtype == dtypes.float64 else f"(1.0f/{x})"}
+
   def __init__(self, target: Target):
     super().__init__(target)
     self.compiler = RkCompiler()
@@ -1098,6 +1177,7 @@ class RkRenderer(ClangJITRenderer):
       'void npu_max_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_max_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
       'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
+      'void npu_matmul_fp16_silu(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
       'void npu_matmul_fp16_batched(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int batch, int M, int K, int N, int weight_t, int relu);',
