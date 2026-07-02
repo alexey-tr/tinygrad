@@ -235,7 +235,7 @@ def _strip_cast(u):
 def _affine_offset(off):
   """Decompose an INDEX offset uop into (base, {range: linear_coeff}) by symbolic substitution
   (invariant under UPCAST/UNROLL/vectorization). Returns None if the offset isn't affine in its
-  ranges. Mirrors the coeff-recovery idiom in _try_match_conv/_try_match_reduce."""
+  ranges. Mirrors the coeff-recovery idiom in _try_match_reduce/_sched_match_matmul."""
   rs = [u for u in off.toposort() if u.op is Ops.RANGE]
   base = off.substitute({x: x.const_like(0) for x in rs}).simplify()
   if base.op is not Ops.CONST: return None
@@ -324,169 +324,6 @@ def _try_match_reduce(uops):
   if any(c >= K for c, _e, is_red in dims if is_red): return None
   return (M, K, kind)
 
-def _try_match_conv(uops):
-  """Return NCHW conv geometry {N,Cin,IH,IW,Cout,KH,KW,OH,OW,sh,sw} if this kernel is a
-  tinygrad-lowered direct conv2d (the CNA's native op), else None.
-
-  The CNA is a direct-convolution engine; matmul is just its 1x1 case (see npu_matmul.c:
-  weight_width/height, conv_x/y_stride, datain_w/h/c, weight_kernels). tinygrad lowers conv2d to
-  `(pool(x) * weight).sum(cin,kh,kw)` — the input is read through an overlapping windowed
-  ShapeTracker. We recover geometry from the INPUT param's affine index, which survives
-  UPCAST/UNROLL/vectorization cleanly (spatial dims stay LOOP ranges, the channel/kernel
-  contraction is REDUCE ranges and/or unrolled constant offsets), plus the three PARAM byte sizes.
-  Output/weight indices are NOT relied on — output-channel UPCAST makes the output index non-affine.
-
-  Safety: a candidate (Cin, IW, KW) factorization is accepted ONLY if the exact set of input bytes
-  it would read equals what the kernel actually reads, so a non-conv (or wrong geometry) can never
-  mis-dispatch — important because a wrong `elements`/geometry on this NPU is an OOB DMA that wedges
-  the SoC. KH=KW=1 collapses to the matmul lowering and is left to the matmul path (_sched_match_matmul). Out of scope
-  (returns None -> CPU fallback): dilation!=1, padding!=0, groups!=1, bias, non-fp16.
-
-  NOTE: not yet wired into render() — that pairs with adding an `npu_conv_fp16` CNA entry point
-  (generalizing gen_matmul_fp16's 1x1 config to weight_width/height + conv strides)."""
-  params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u: u.arg)
-  if len(params) != 3 or [p.arg for p in params] != [0, 1, 2]: return None
-  out_p, in_p, w_p = params
-  if any(p.dtype.base is not dtypes.half for p in params): return None
-  out_sz, in_sz, w_sz = out_p.dtype.size, in_p.dtype.size, w_p.dtype.size
-
-  def extent(r): return r.src[0].arg if r.src and r.src[0].op is Ops.CONST else None
-  def is_reduce(r): return len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE
-
-  # affine {range: coeff} for the INPUT param, plus per-node (const, [(coeff,extent)...], vec) so we
-  # can reconstruct the exact set of input bytes read.
-  in_idx = [u for u in uops if u.op is Ops.INDEX and u.src[0] is in_p]
-  if not in_idx: return None
-  ic, nodes, has_dvar = {}, [], False
-  for ix in in_idx:
-    off = ix.src[1]
-    rs  = [u for u in off.toposort() if u.op is Ops.RANGE]
-    dvs = [u for u in off.toposort() if u.op is Ops.DEFINE_VAR]  # core_id (multi-core dispatch)
-    if dvs: has_dvar = True
-    subs0 = {x: x.const_like(0) for x in rs + dvs}
-    base = off.substitute(subs0).simplify()
-    if base.op is not Ops.CONST: return None
-    terms = []
-    for r in rs:
-      b = off.substitute({**{x: x.const_like(0) for x in dvs},
-                          **{x: x.const_like(1 if x is r else 0) for x in rs}}).simplify()
-      if b.op is not Ops.CONST: return None
-      cf = b.arg - base.arg
-      if cf == 0: continue
-      if ic.get(r, cf) != cf: return None
-      ic[r] = cf
-      e = extent(r)
-      if e is None: return None
-      terms.append((cf, e))
-    V = 1
-    for c in uops:
-      if c.op is Ops.CAST and ix in c.src and c.dtype.count > 1: V = c.dtype.count
-    nodes.append((base.arg, terms, V))
-
-  # Anchor on the CIN reduce loop: coeff = IH*IW (channel stride in the input), extent = Cin.
-  # This is robust to spatial-loop tiling/UPCAST that would break assumptions about loop ordering
-  # (e.g. tinygrad tiles OW by KW, making the OW-loop step = KW*stride, not stride).
-  reduces = [r for r in ic if is_reduce(r)]
-  if len(reduces) != 1: return None
-  cin_stride, Cin = ic[reduces[0]], extent(reduces[0])  # cin_stride = IH*IW
-  if cin_stride is None or Cin is None: return None
-  if in_sz % (Cin * cin_stride): return None
-  N_total = in_sz // (Cin * cin_stride)
-  if N_total < 1: return None
-  # Multi-core dispatch (has_dvar): tinygrad splits the batch across cores via the core_id
-  # DEFINE_VAR; with core_id substituted = 0 the access set covers only one batch item.
-  # Factorize against per-core sizes (N=1); tinygrad's global_size threads each call
-  # npu_conv_fp16(N=1) with the correct feat_va/dst_va slice for their batch item.
-  if has_dvar:
-    if out_sz % N_total: return None
-    N, out_sz_use = 1, out_sz // N_total
-  else:
-    if out_sz % N_total: return None
-    N, out_sz_use = N_total, out_sz
-  if out_sz_use < 1: return None
-
-  # exact set of input offsets the kernel reads (vec/tiling-agnostic); bail if too large to enumerate
-  visits = 1
-  for _c, terms, Vv in nodes:
-    n = Vv
-    for _cf, e in terms: n *= e
-    visits += n
-  if visits > (1 << 20): return None
-  actual = set()
-  def rec(i, terms, acc, V, out):
-    if i == len(terms):
-      for l in range(V): out.add(acc + l)
-      return
-    cf, e = terms[i]
-    for v in range(e): rec(i + 1, terms, acc + v * cf, V, out)
-  for c, terms, V in nodes: rec(0, terms, c, V, actual)
-
-  def divisors(n): return [d for d in range(1, n + 1) if n % d == 0]
-  # Search (Cout, IH, IW, KH, KW, sh, sw) consistent with all three param sizes.
-  for Cout in divisors(out_sz_use // N):
-    if w_sz % (Cout * Cin): continue
-    OHOW = (out_sz_use // N) // Cout
-    KHKW = w_sz // (Cout * Cin)
-    if KHKW <= 1: continue                              # KH=KW=1 → matmul's job
-    for IW in divisors(cin_stride):
-      IH = cin_stride // IW
-      for KW in divisors(KHKW):
-        KH = KHKW // KW
-        if IW < KW or IH < KH: continue
-        for sw in range(1, IW - KW + 2):
-          OW = (IW - KW) // sw + 1
-          if OHOW % OW: continue
-          OH = OHOW // OW
-          if OH < 1: continue
-          sh_num, sh_den = IH - KH, max(OH - 1, 1)
-          if sh_num % sh_den: continue
-          sh = max(sh_num // sh_den, 1)             # min stride 1 (IH==KH → OH=1 → sh=0 guard)
-          if (IH - KH) // sh + 1 != OH: continue
-          pred = set()
-          for n in range(N):
-            for cin in range(Cin):
-              for y in range(OH):
-                for x in range(OW):
-                  b = n * Cin * cin_stride + cin * cin_stride + (y * sh) * IW + (x * sw)
-                  for ky in range(KH):
-                    row = b + ky * IW
-                    for kx in range(KW): pred.add(row + kx)
-          # OH==OW==1 means the kernel spans the entire input (KH==IH, KW==IW, no spatial
-          # sliding) — that is a full-reduction GEMM, not a convolution, and routing it to
-          # npu_conv_fp16 mis-computes it (e.g. a plain M×K@K×N matmul whose K-contraction
-          # happens to factor as Cin·KH gives N=M images, Cout=N_matmul, OH=OW=1 -> garbage,
-          # the 400×64×8192 bug). A real conv reduces here only when it slides (OH>1 or OW>1);
-          # the matmul-equivalent case is left to _sched_match_matmul. (_conv_signature won't
-          # block that fallthrough: a matmul's contraction coeff is <=16, not the >16 spatial
-          # channel stride it keys on.)
-          if pred == actual and not (OH == 1 and OW == 1):
-            return dict(N=N, Cin=Cin, IH=IH, IW=IW, Cout=Cout, KH=KH, KW=KW,
-                        OH=OH, OW=OW, sh=sh, sw=sw, multicore=has_dvar)
-  return None
-
-def _conv_signature(uops):
-  """True if the kernel is conv-shaped — used to stop a conv that _try_match_conv couldn't parse from
-  being mis-grabbed by the matmul path (KH=KW=1 -> _sched_match_matmul handles it directly).
-  Signal: the INPUT (param1) has a REDUCE range with coefficient > 16 (= the channel stride IH*IW). A
-  matmul's contraction is contiguous/vectorized in its input (coeff = 1 or the vector width, <= 16), so
-  it never trips this; a spatial conv's cin stride IH*IW is large. (The weight param can't be used —
-  output-channel UPCAST makes it non-affine.) Cost: misses tiny-spatial (IH*IW<=16) convs."""
-  params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u: u.arg)
-  if len(params) != 3 or [p.arg for p in params] != [0, 1, 2]: return False
-  def is_reduce(r): return len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE
-  in_p = params[1]
-  for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is in_p]:
-    off = ix.src[1]
-    rs  = [u for u in off.toposort() if u.op is Ops.RANGE]
-    dvs = [u for u in off.toposort() if u.op is Ops.DEFINE_VAR]  # core_id (multi-core dispatch)
-    base = off.substitute({x: x.const_like(0) for x in rs + dvs}).simplify()
-    if base.op is not Ops.CONST: continue
-    for r in rs:
-      if not is_reduce(r): continue
-      b = off.substitute({**{x: x.const_like(0) for x in dvs},
-                          **{x: x.const_like(1 if x is r else 0) for x in rs}}).simplify()
-      if b.op is Ops.CONST and (b.arg - base.arg) > 16: return True
-  return False
 
 class RkCompiler(ClangJITCompiler):
   def compile(self, src:str) -> bytes:
@@ -520,15 +357,13 @@ class RkRenderer(ClangJITRenderer):
 
   def render(self, uops: list[UOp]) -> str:
     # *** Conv fast path ***
-    # tinygrad lowers conv2d to (pool(x) * weight).sum(cin,kh,kw); _try_match_conv recovers NCHW
-    # geometry from the input PARAM's windowed index (None for 1x1 -> matmul, and for
-    # dilation/padding/groups/non-fp16). PARAMs emit in arg order: 0=output, 1=input, 2=weight.
-    # Route the whole kernel to one npu_conv_fp16() (fp16 output, matching tinygrad's fp16 conv).
-    # Schedule-level conv match (stashed by the hook) is authoritative when present; otherwise fall
-    # back to the render-path _try_match_conv. A matmul annotation means this is not a conv (-> None).
-    _ann = _sched_ann_current
-    cv = (_ann if (_ann is not None and _ann.get('kind') == 'conv') else None) if _ann is not None \
-         else _try_match_conv(uops)
+    # tinygrad lowers conv2d to (pool(x) * weight).sum(cin,kh,kw). The schedule-level _sched_match_conv
+    # (stashed in _sched_ann_current by the get_runner hook) recovers NCHW geometry from the clean
+    # pre-opt AST and tags it kind='conv'; render emits one npu_conv_fp16() from it. Anything it can't
+    # prove (dilation/padding/groups/unit-kernel-dim/non-fp16, or a matmul annotation) -> CPU. The old
+    # post-linearize _try_match_conv was deleted: it mis-dispatched rect/k1x3/dilation/groups convs to
+    # garbage AND missed valid k5/strided ones; the schedule matcher fixes both.
+    cv = _sched_ann_current if (_sched_ann_current is not None and _sched_ann_current.get('kind') == 'conv') else None
     if cv is not None:
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
@@ -557,10 +392,6 @@ class RkRenderer(ClangJITRenderer):
                   f"{g['KH']}, {g['KW']}, {g['sh']}, {g['sw']}, 1);"]
           self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
-    # Conv-shaped but unparsed (heavy UPCAST): fall back to CPU rather than let the matmul matcher
-    # size-factor it into a bogus matmul (silent wrong results). Correctness over coverage.
-    if _conv_signature(uops):
-      return super().render(uops)
 
     # *** Batched matmul fast path (attention q@kᵀ / attn@v, [B,H,T,·]) ***
     # Bh>1 branch of the schedule-level match stashed by the get_runner hook (_sched_ann_current).
