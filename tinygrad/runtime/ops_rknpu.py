@@ -115,7 +115,7 @@ _lib.npu_neg_bf16.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ct
 #                                  int M, int K, int N, int relu, float bias, const float *pcbias)
 # `relu` (0/1) fuses max(0,x); `bias` (scalar) fuses x+bias; `pcbias` (host fp32 array[N] or
 # NULL) fuses the per-channel bias x+bias[n] — all in the BS stage, same submit. relu AND
-# per-channel bias are auto-dispatched (see _matmul_epilogue / _try_match_matmul); scalar `bias`
+# per-channel bias are auto-dispatched (see _sched_match_matmul); scalar `bias`
 # is ctypes-only (render passes 0.0) — a const-add epilogue can't be reliably told from the
 # matmul's own ADDs. pcbias is fp16-only in the runtime (bf16/int8 wrappers take but ignore it).
 for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8', 'npu_matmul_fp16_bt', 'npu_matmul_int8_bt',
@@ -228,119 +228,9 @@ _NPU_MATMUL = {
 # wrapper (it expects 2-byte bf16 inputs) and the NPU has no native fp32 matmul, so bf16 falls back
 # to CPU. (The DPU also can't emit bf16 output — no FP32->BF16 downcast bit — hence fp32 output.)
 
-# multiply-class ops that count as a matmul "product" (MULACC is fused multiply-add; absent in some
-# tinygrad versions, hence the guarded set).
-_MM_MUL_OPS = {Ops.MUL} | ({Ops.MULACC} if hasattr(Ops, 'MULACC') else set())
-# add-class ops that count as a matmul "accumulation" (summing the K products). MULACC also
-# accumulates. A matmul SUMS its products; an elementwise mul/div does not -> n_fadd distinguishes
-# them when the EW MULs are NOT pre-empted to CUSTOM (the RKNPU_RAM_BUFFERS path).
-_MM_ADD_OPS = {Ops.ADD} | ({Ops.MULACC} if hasattr(Ops, 'MULACC') else set())
-
-# Select/compare/transcendental float ops that a plain matmul accumulation NEVER emits (it is
-# only MUL/ADD over the K loop). Their presence means an elementwise EPILOGUE was fused onto the
-# accumulator. MUL/ADD are deliberately excluded — they ARE the matmul. (Mirrors the _EXTRA
-# watchlist in _try_match_reduce, minus MUL.)
-_MM_EPILOGUE_OPS = {Ops.SUB, Ops.NEG, Ops.MAX, Ops.WHERE, Ops.RECIPROCAL, Ops.SQRT,
-                    Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CMPLT, Ops.CMPNE}
-
-def _is_zero_const(u): return u.op is Ops.CONST and u.arg == 0
-
-def _where_is_relu(w):
-  # ReLU lowers to where(0 < x, x, 0)  (or the symmetric where(x < 0, 0, x)).
-  if w.op is not Ops.WHERE or len(w.src) != 3: return False
-  cond, tval, fval = w.src
-  if cond.op is not Ops.CMPLT or len(cond.src) != 2: return False
-  lo, hi = cond.src
-  if _is_zero_const(lo) and tval is hi and _is_zero_const(fval): return True   # where(0<x, x, 0)
-  if _is_zero_const(hi) and _is_zero_const(tval) and fval is lo: return True   # where(x<0, 0, x)
-  return False
-
-def _max_is_relu(m):
-  return m.op is Ops.MAX and len(m.src) == 2 and (_is_zero_const(m.src[0]) or _is_zero_const(m.src[1]))
-
-_SILU_C = -1.4426950408889634   # -log2(e): the constant in sigmoid's exp2 (exp(-x) == exp2(-log2(e)*x))
-
 def _strip_cast(u):
   while u.op in (Ops.CAST, Ops.GEP, Ops.BITCAST) and len(u.src) == 1: u = u.src[0]
   return u
-
-def _is_silu_fdiv(fd):
-  """For an FDIV node: True if it is silu = x / (1 + exp2(-log2(e)*x)) with the numerator BEING the
-  accumulator x; False if it is the sigmoid shape 1/(1+exp2(..x)) (numerator is const 1.0, not x);
-  None if it isn't the sigmoid-denominator shape at all. The True-vs-False split is what distinguishes
-  silu from sigmoid — impossible by op histogram (they're identical). Requires native EXP2 (RkRenderer
-  keeps it in code_for_op) so the shape isn't a decomposed polynomial blob."""
-  if fd.op is not Ops.FDIV or len(fd.src) != 2: return None
-  num, den = fd.src
-  if den.op is not Ops.ADD or len(den.src) != 2: return None
-  ones = [s for s in den.src if s.op is Ops.CONST and abs(s.arg - 1.0) < 1e-6]
-  exps = [s for s in den.src if s.op is Ops.EXP2]
-  if len(ones) != 1 or len(exps) != 1: return None
-  mul = exps[0].src[0]
-  if mul.op is not Ops.MUL or len(mul.src) != 2: return None
-  cs = [s for s in mul.src if s.op is Ops.CONST and abs(s.arg - _SILU_C) < 1e-3]
-  xs = [s for s in mul.src if not (s.op is Ops.CONST and abs(s.arg - _SILU_C) < 1e-3)]
-  if len(cs) != 1 or len(xs) != 1: return None
-  return _strip_cast(num) is _strip_cast(xs[0])
-
-def _epilogue_is_silu(uops):
-  """True iff the kernel computes EXACTLY silu(accumulator). Two conditions:
-   1. EVERY FDIV is the silu shape x/(1+exp2(-log2(e)*x)) with numerator == the accumulator. This
-      rejects sigmoid (numerator is const 1.0) and gelu/tanh (FDIV numerator is exp2-1, not x).
-   2. Each silu FDIV's result flows ONLY to a STORE (through layout wrappers CAST/VECTORIZE/GEP/
-      BITCAST), never into another MUL/ADD/etc. This rejects silu*c / silu+c / f(silu) — they'd drop
-      the trailing op -> those correctly fall back to CPU.
-  SOUND: any deviation -> False. Validated against silu (accept) and plain/relu/sigmoid/gelu/tanh/
-  silu*2/silu+1 (reject)."""
-  fdivs = [u for u in uops if u.op is Ops.FDIV]
-  if not fdivs: return False
-  if any(_is_silu_fdiv(f) is not True for f in fdivs): return False
-  consumers = {}
-  for u in uops:
-    for s in u.src: consumers.setdefault(s, []).append(u)
-  WRAP = {Ops.CAST, Ops.VECTORIZE, Ops.GEP, Ops.BITCAST}
-  def flows_to_store_only(start):
-    stack, seen = [start], set()
-    while stack:
-      u = stack.pop()
-      for c in consumers.get(u, ()):
-        if c.op is Ops.STORE: continue
-        if c.op in WRAP:
-          if c not in seen: seen.add(c); stack.append(c)
-        else: return False                       # a non-wrapper op consumes the silu result -> not pure silu
-    return True
-  return all(flows_to_store_only(f) for f in fdivs)
-
-def _matmul_epilogue(uops):
-  """Classify the fused epilogue on a matmul kernel: 'plain', 'relu', 'silu', or None.
-
-  None means a select/compare/transcendental epilogue is present that we can't fuse (sigmoid,
-  gelu, tanh, exp, ...); the caller MUST fall back to CPU rather than run a plain matmul and
-  silently drop it.
-
-  No dtype filter: plain matmuls — fp16 AND int8(->int32), aligned/unaligned/M-tiled — emit
-  ZERO select/compare/transcendental ops (verified by probe), so any such op means a fused
-  epilogue. We don't filter on float/half because the int8 path's ReLU compares in int32, not
-  float. The relu-SHAPE check (where(0<x,x,0) / max(x,0)) is specific enough that it would not
-  match an index/padding mask (where(idx<bound, val, 0)) even if one appeared.
-
-  LIMITATION (pre-existing, unchanged by this matcher): a pure MUL/ADD-const epilogue — e.g.
-  (a@b)*2.0 or (a@b)+1.0 — uses only MUL/ADD, indistinguishable from the matmul body by op
-  type, so it classifies as 'plain' and the scale/offset is dropped. ReLU and a per-channel
-  bias-vector (4th PARAM, folded via pcbias — see _try_match_matmul/_validate_bias, and it
-  composes with relu since the bias ADD is invisible here) are handled, as are transcendental
-  activations (-> CPU); a scalar const-affine fusion is not."""
-  present = {u.op for u in uops if u.op in _MM_EPILOGUE_OPS}
-  if not present: return 'plain'
-  wheres = [u for u in uops if u.op is Ops.WHERE]
-  maxes  = [u for u in uops if u.op is Ops.MAX]
-  if present <= {Ops.WHERE, Ops.CMPLT} and wheres and all(_where_is_relu(w) for w in wheres): return 'relu'
-  if present == {Ops.MAX} and maxes and all(_max_is_relu(m) for m in maxes): return 'relu'
-  # silu = x*sigmoid(x): epilogue is just EXP2 (the sigmoid's exp) + an FDIV; structural check (NOT
-  # op-histogram — silu and sigmoid have identical histograms) confirms it's silu, not sigmoid/gelu.
-  # NPU_NO_SILU=1 disables the fused-silu dispatch (for A/B benchmarking) -> the fused kernel -> CPU.
-  if present <= {Ops.EXP2} and not os.environ.get('NPU_NO_SILU') and _epilogue_is_silu(uops): return 'silu'
-  return None
 
 def _affine_offset(off):
   """Decompose an INDEX offset uop into (base, {range: linear_coeff}) by symbolic substitution
@@ -355,386 +245,6 @@ def _affine_offset(off):
     if b.op is not Ops.CONST: return None
     co[r] = b.arg - base.arg
   return base.arg, co
-
-def _validate_bias(uops, B_p, bias_p, N):
-  """True iff `bias_p` is a per-channel bias vector broadcast-ADDed over the output's N (channel)
-  axis — the `+ bias[n]` of `a@b + bias[n]` (e.g. nn.Linear). SOUND: any structural deviation
-  returns False so the matmul matcher falls back to CPU rather than fold the wrong thing.
-
-  The N (output-channel) axis is identified from the B=[K,N] operand, NOT the output or A — tinygrad
-  upcasts those into non-affine stores once M is large. B's index depends (nonzero coeff) only on the
-  K (reduce) range and the N range(s), so an N range is just a non-reduce range that indexes B (true
-  for the [N,K] transposed weight too). M never indexes B, so a per-row bias[m] — depending on an M
-  range — is rejected even when M==N. A genuine bias[n] depends ONLY on N ranges (hence invariant over
-  M and the K contraction) and, with its vectorized lane width, tiles exactly [0,N): each channel once."""
-  if bias_p.dtype.base is not dtypes.half: return False     # pcbias fold is fp16-only in the runtime
-  if bias_p.dtype.size != N: return False                   # must be exactly the N-length channel vector
-  def is_reduce(r): return len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE
-  n_ranges = set()                                          # B's non-reduce nonzero-coeff ranges = N axis
-  for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is B_p]:
-    r = _affine_offset(ix.src[1])                           # tolerate (skip) non-affine B index nodes
-    if r is None: continue
-    n_ranges |= {rng for rng, c in r[1].items() if c != 0 and not is_reduce(rng)}
-  if not n_ranges: return False
-  bias_idx = [u for u in uops if u.op is Ops.INDEX and u.src[0] is bias_p]
-  if not bias_idx: return False
-  for ix in bias_idx:
-    r = _affine_offset(ix.src[1])
-    if r is None: return False
-    base, co = r
-    if base != 0: return False                              # bias starts at channel 0 (N not tiled)
-    terms = []
-    for rng, c in co.items():
-      if c == 0: continue
-      if rng not in n_ranges: return False                 # touches M/K -> not a per-channel bias[n]
-      ext = rng.src[0].arg if rng.src and rng.src[0].op is Ops.CONST else None
-      if ext is None: return False
-      terms.append((c, ext))
-    V = 1                                                   # vectorized lanes of this load (innermost dim)
-    for c in uops:
-      if c.op is Ops.CAST and ix in c.src and c.dtype.count > 1: V = c.dtype.count
-    stride = V                                              # require contiguous tiling of exactly [0,N)
-    for c, e in sorted(terms):
-      if c != stride: return False
-      stride *= e
-    if stride != N: return False
-  return True
-
-def _try_match_matmul(uops):
-  """Return (M, N, K, fn, relu, bias_pidx) if this uop list is a tinygrad-lowered matmul of a
-  supported dtype AND the wrapper can actually handle the size, else None. `bias_pidx` is the PARAM
-  arg of a fused per-channel bias vector (`a@b + bias[n]`), or None for a plain/relu matmul.
-
-  Detection is size-based, not kernel-name-based, because tinygrad's loop-opt passes (UPCAST,
-  UNROLL, etc.) rename `r_M_N_K` into multi-axis forms like `r_50_4_2_4_4_16_4`. The PARAM
-  pointer sizes are invariant under those passes, so we recover (M, N, K) from them:
-    out_sz = M*N,  p1_sz = M*K,  p2_sz = K*N   (PARAM-arg order: 0=output, 1=A, 2=B)
-    => K*K = p1_sz * p2_sz / out_sz
-    => M = p1_sz / K,  N = p2_sz / K
-  A REDUCE_AXIS or RANGE somewhere in the AST is required so we don't latch onto a pure
-  element-wise kernel that happens to have matching PARAM sizes (e.g. M=K=N=1).
-
-  Final check: the wrapper's pick_tile algorithm has a CBUF feasibility envelope. If the
-  matcher accepts a size the wrapper then rejects ("cannot tile"), the wrapper returns
-  without writing dst — silently corrupting downstream consumers (the kernel runs but its
-  output is the buffer's prior contents). So we MUST mirror the wrapper's tile-feasibility
-  check here and fall back to CPU when it would fail."""
-  import os, math
-  dbg = os.environ.get('NPU_MATMUL_DEBUG') == '1'
-  if not any(u.op in (Ops.REDUCE_AXIS, Ops.RANGE) for u in uops):
-    return None
-  # A real matmul contracts over K: it accumulates K products. A perfect-square-length elementwise op
-  # (out=p1=p2 => M=N=K=sqrt) factors to the SAME PARAM sizes, so we MUST distinguish by structure:
-  #   - looped K  -> a DEFINE_REG accumulator and/or a REDUCE-typed RANGE
-  #   - unrolled K -> the K products are SUMMED (an ADD tree: n_fadd>=1 alongside n_fmul>=2)
-  # An elementwise mul/div has multiple MULs (one per upcast lane) but NEVER sums them (n_fadd==0),
-  # so it is rejected. NOTE: keying on n_fmul>=2 ALONE is not enough once EW ops are NOT pre-empted
-  # to CUSTOM (the RKNPU_RAM_BUFFERS path): a square EW mul has n_fmul==upcast>=2 and would wrongly
-  # run as a fake NxNxN matmul (e.g. (16,16) EW mul -> 256=16^2 -> bogus 16x16x16 matmul via the _bt
-  # path, garbage out). Requiring summation (DEFINE_REG | reduce-range | adds) closes that. (Pairing
-  # n_fmul>=2 WITH n_fadd>=1 is safe: `a-b` => ADD(a,MUL(b,-1)) has n_fmul<2; multi-input fused EW
-  # like (a*b)+(c*d) is already rejected by the 3/4-PARAM count below.)
-  n_fmul = sum(1 for u in uops if u.op in _MM_MUL_OPS and u.dtype.scalar() in (dtypes.float, dtypes.half))
-  n_fadd = sum(1 for u in uops if u.op in _MM_ADD_OPS and u.dtype.scalar() in (dtypes.float, dtypes.half))
-  has_reduce_range = any(u.op is Ops.RANGE and isinstance(u.arg, tuple) and len(u.arg) > 1
-                         and u.arg[-1] is AxisType.REDUCE for u in uops)
-  if not (any(u.op is Ops.DEFINE_REG for u in uops) or has_reduce_range or (n_fmul >= 2 and n_fadd >= 1)):
-    if dbg: print("[mm-match] reject: no K-accumulation (elementwise kernel?)")
-    return None
-  # Classify any fused elementwise epilogue: plain matmul, fused ReLU (DPU BS stage), or an
-  # unrecognized activation we must NOT silently drop (-> CPU fallback). See _matmul_epilogue.
-  epi = _matmul_epilogue(uops)
-  if epi is None:
-    if dbg: print("[mm-match] reject: fused epilogue is not plain or relu (-> CPU)")
-    return None
-  relu = 1 if epi == 'relu' else 0
-  params = sorted([u for u in uops if u.op is Ops.PARAM], key=lambda u: u.arg)
-  # 3 PARAMs = plain/relu matmul (out, A, B); a 4th PARAM is the per-channel bias of a@b+bias[n].
-  if len(params) not in (3, 4): return None
-  if params[0].arg != 0 or params[1].arg != 1 or params[2].arg != 2: return None
-  if len(params) == 4 and params[3].arg != 3: return None
-  # PARAM dtypes are PtrDType wrappers; .base unwraps to the scalar element type.
-  out_dt = params[0].dtype.base
-  in_dt  = params[1].dtype.base
-  if params[2].dtype.base != in_dt: return None    # A and B must share a dtype
-  fn = _NPU_MATMUL.get((in_dt, out_dt))
-  if fn is None: return None
-  out_sz, p1_sz, p2_sz = params[0].dtype.size, params[1].dtype.size, params[2].dtype.size
-  if out_sz < 1 or p1_sz < 1 or p2_sz < 1: return None
-  k_sq_num = p1_sz * p2_sz
-  if k_sq_num % out_sz != 0: return None
-  k_sq = k_sq_num // out_sz
-  K = math.isqrt(k_sq)
-  if K * K != k_sq or K < 1: return None
-  if p1_sz % K != 0 or p2_sz % K != 0: return None
-  M = p1_sz // K
-  N = p2_sz // K
-  if M * N != out_sz or M < 1 or N < 1: return None
-
-  # Mirror pick_tile feasibility: K_pad weight column must fit one CBUF bank, AND there must
-  # be enough remaining banks for at least one Mt slab of input data. The wrapper enforces
-  # Mt>=4 (or 1 when M==1) and Nt>=N_align (16 fp16/bf16, 32 int8). Element width follows the
-  # INPUT dtype (int8 inputs are 1 byte even though the output is int32).
-  elem_bytes = 2 if in_dt in (dtypes.half, dtypes.bfloat16) else 1
-  N_align = 16 if elem_bytes == 2 else 32
-  K_pad = ((K + 31) // 32) * 32
-  CBUF_BANK = 32768
-  CBUF_BANKS_USABLE = 11   # 12 total - 1 reserved
-  if K_pad * elem_bytes > CBUF_BANK: return None
-  Nt_min = N_align
-  weight_banks_min = (K_pad * Nt_min * elem_bytes + CBUF_BANK - 1) // CBUF_BANK
-  data_banks_avail = CBUF_BANKS_USABLE - weight_banks_min
-  Mt_floor = 1 if M == 1 else 4
-  if data_banks_avail < 1: return None
-  if Mt_floor * K_pad * elem_bytes > data_banks_avail * CBUF_BANK: return None
-
-  # PARAM1 (A) LAYOUT CHECK. npu_matmul_* reads its 1st operand as row-major contiguous [M,K]:
-  # element (m,k) at offset m*K + k, the contraction k being the innermost contiguous run. A
-  # permuted/strided A view (e.g. attention's `attn.transpose(1,2).reshape(B*T,D).matmul(wo)`, where
-  # the [B,H,T,Dh] base is reshaped through a transpose) has the SAME byte size M*K, so the size-based
-  # recovery can't see it — but its lowered load interleaves the K axis ABOVE the M stride, and the
-  # wrapper would read the bytes in the wrong order => SILENT garbage (the ~1.1 rel-err attention gap).
-  # Detect by the affine coeffs of A's INDEX: in true [M,K] every reduce(k)-range coeff sits BELOW
-  # every loop(m)-range coeff (k is the inner block, m strides over whole rows). If a reduce coeff
-  # reaches/exceeds a loop coeff (interleaved), or the index is non-affine, the layout isn't packed
-  # [M,K] -> reject to CPU (there is no _at transposed-A fast path; correctness beats the offload).
-  # core_id (multicore M-partition) is a DEFINE_VAR, not a RANGE -> treat as loop. Zero-coeff ranges
-  # (don't index A) are ignored; an empty reduce/loop set (M fully upcast, or M==1) can't prove a
-  # permute, so it is left to pass (mirrors the PARAM2 check's conservative default).
-  for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is params[1]]:
-    off  = ix.src[1]
-    rs   = [u for u in off.toposort() if u.op is Ops.RANGE]
-    dvar = [u for u in off.toposort() if u.op is Ops.DEFINE_VAR]
-    zero = {x: x.const_like(0) for x in rs + dvar}
-    base = off.substitute(zero).simplify()
-    a_red, a_loop, a_nonaff = [], [], (base.op is not Ops.CONST)
-    for x in rs + dvar:
-      z1 = dict(zero); z1[x] = x.const_like(1)
-      b = off.substitute(z1).simplify()
-      if b.op is not Ops.CONST: a_nonaff = True; continue
-      d = b.arg - base.arg
-      if d == 0: continue
-      (a_red if (x.op is Ops.RANGE and len(x.arg) > 1 and x.arg[-1] is AxisType.REDUCE) else a_loop).append(d)
-    if a_nonaff or (a_red and a_loop and max(a_red) >= min(a_loop)):
-      if dbg: print(f"[mm-match] reject: PARAM1 (A) not packed [M,K] "
-                    f"(reduce={sorted(a_red)} loop={sorted(a_loop)} nonaffine={a_nonaff}) -> CPU")
-      return None
-
-  # PARAM2 (B) LAYOUT CHECK. npu_matmul_* tiles its 2nd operand assuming row-major [K,N] (it
-  # transposes-while-tiling). A genuinely-transposed [N,K]-contiguous operand (e.g.
-  # B.T.contiguous().realize(), or any materialized transposed weight) has identical byte size K*N,
-  # so the size-based recovery above can't tell it from [K,N]. Inspect the stride structure: in [K,N]
-  # the contraction k is the strided dim and the output dim n is contiguous-ish (max loop coeff <= min
-  # reduce coeff); [N,K] inverts that. (Calibrated on the matmul suite: [K,N] gives loop in {1,4},
-  # reduce in {16,17,64,128,16384,32768} or empty; [N,K] gives loop={K}, reduce={1}.) [K,N] -> normal;
-  # [N,K] fp16 -> the pre-transposed fast path npu_matmul_fp16_bt (contiguous weight pack, no
-  # transpose); [N,K] for bf16/int8 (no _bt variant) or can't-tell -> reject (-> CPU).
-  if N > 1:
-    Rc, Lc, p2_nonaffine = set(), set(), False
-    for ix in [u for u in uops if u.op is Ops.INDEX and u.src[0] is params[2]]:
-      off = ix.src[1]; rs = [u for u in off.toposort() if u.op is Ops.RANGE]
-      base = off.substitute({x: x.const_like(0) for x in rs}).simplify()
-      if base.op is not Ops.CONST: p2_nonaffine = True; continue
-      for r in rs:
-        b = off.substitute({x: x.const_like(1 if x is r else 0) for x in rs}).simplify()
-        if b.op is Ops.CONST and (b.arg - base.arg):
-          (Rc if (len(r.arg) > 1 and r.arg[1] is AxisType.REDUCE) else Lc).add(b.arg - base.arg)
-    if   p2_nonaffine: layout = 'unknown'
-    elif Rc and Lc:    layout = 'kn' if max(Lc) <= min(Rc) else ('nk' if max(Rc) <= min(Lc) else 'unknown')
-    elif Rc:           layout = 'kn' if min(Rc) > 1 else 'nk'
-    elif Lc:           layout = 'kn' if min(Lc) == 1 else 'nk'
-    else:              layout = 'kn'                                   # both unrolled / degenerate
-    if layout == 'unknown':
-      if dbg: print(f"[mm-match] reject: PARAM2 layout unclear (reduce={sorted(Rc)} loop={sorted(Lc)})")
-      return None
-    if layout == 'nk':
-      bt = {'npu_matmul_fp16': 'npu_matmul_fp16_bt',
-            'npu_matmul_int8': 'npu_matmul_int8_bt'}.get(fn)          # pre-transposed weight fast path
-      if bt is None:
-        if dbg: print(f"[mm-match] reject: transposed [N,K] weight, no _bt variant for {fn}")
-        return None
-      fn = bt
-      if dbg: print(f"[mm-match] PARAM2 is [N,K] -> {fn}")
-
-  # PER-CHANNEL BIAS. A 4th PARAM is the `+ bias[n]` of `a@b + bias[n]`. Only the fp16 wrappers fold
-  # pcbias (bf16/int8 ignore it), and the bias must be a genuine broadcast-over-N vector — otherwise
-  # fall back to CPU (never silently drop a 4th input). The bias ADD is invisible to _matmul_epilogue
-  # (plain ADD), so relu composes: relu(a@b + bias[n]) classifies as 'relu' AND folds the bias.
-  bias_pidx = None
-  if len(params) == 4:
-    if fn not in ('npu_matmul_fp16', 'npu_matmul_fp16_bt'):
-      if dbg: print(f"[mm-match] reject: 4th (bias) PARAM but {fn} has no pcbias fold -> CPU")
-      return None
-    if not _validate_bias(uops, params[2], params[3], N):
-      if dbg: print("[mm-match] reject: 4th PARAM is not a broadcast-over-N bias -> CPU")
-      return None
-    bias_pidx = params[3].arg
-
-  # SILU epilogue -> npu_matmul_fp16_silu (row-major matmul + on-NPU silu LUT fold + /5658 dequant,
-  # with a CPU fallback inside the wrapper for |a@b|>~11.5 where the fp16 silu*5658 intermediate would
-  # overflow). fp16 [K,N] only (the silu LUT is fp16; no _bt/int8/bf16 variant), no per-channel bias,
-  # and M*N % 8 == 0 (silu cube granularity). Anything else -> CPU (never silently miscompute).
-  if epi == 'silu':
-    if fn != 'npu_matmul_fp16' or bias_pidx is not None or (M * N) % 8 != 0:
-      if dbg: print("[mm-match] silu epilogue but unsupported (need fp16 [K,N], no bias, M*N%8==0) -> CPU")
-      return None
-    fn = 'npu_matmul_fp16_silu'
-
-  if dbg: print(f"[mm-match] M={M} K={K} N={N} relu={relu} silu={epi=='silu'} bias={bias_pidx is not None} "
-                f"(out={out_sz} p1={p1_sz} p2={p2_sz})")
-  return (M, N, K, fn, relu, bias_pidx)
-
-def _try_match_batched_matmul(uops):
-  """Return a dict {Bh,M,K,N,fn,layout,bs_out,bs_a,bs_b} if this kernel is a BATCHED matmul
-  (attention's `q@kᵀ` / `attn@v`, shape [B,H,T,·]) of a supported dtype that the runtime can
-  handle, else None. v1: plain fp16 matmul only (no relu/bias epilogue, no int8) — anything else
-  falls back to CPU rather than silently dropping it.
-
-  WHY a separate matcher: the 2D `_try_match_matmul` recovers K via `K²=p1·p2/out`+isqrt, but a
-  batch dim multiplies all three PARAM sizes (→ `Bh·K²`), so isqrt goes non-integer and 2D rejects
-  it. Here we recover Bh from the loop structure FIRST, divide it out, then reuse the 2D size
-  recovery per-slice.
-
-  Recovery (empirically grounded on real RKNPU-lowered uops; see rknpu-batched-matmul-recovery
-  memory). For a batched matmul each operand's batch slice is contiguous, so the affine index of
-  every PARAM carries a batch RANGE whose stride is the per-slice element count:
-    out[b]: batch·(M·N) + m·N + n      A[b]: batch·(M·K) + m·K + ...     B[b]: batch·(K·N) + ...
-  Classify each range by which of the 3 PARAMs it indexes (nonzero affine coeff):
-    batch -> out & A & B   |   M -> out & A   |   N -> out & B   |   K(reduce) -> A & B (often unrolled)
-  - Accumulation guard: require >=1 range that indexes EXACTLY 2 of the 3 PARAMs (an M/N/K range).
-    A batched element-wise `A*B` has every range indexing all 3 (C[i]=A[i]*B[i]) -> no 2-of-3 range
-    -> rejected. This range-based check is more robust here than the 2D matcher's MUL-count guard.
-  - Contiguity cross-check (the safety guard against mis-recovery -> silent corruption): the batch
-    axes must densely, nestedly tile each buffer with the per-slice block (M·N / M·K / K·N) as the
-    innermost unit. Mismatch -> reject.
-
-  Robust to the realities of on-device lowering (see the memory note): the batch dim appears as a
-  RANGE (small kernels) or the multicore `core_id` DEFINE_VAR (large kernels), and may split across
-  several axes (B>1); M/N/K are recovered from PARAM sizes (UPCAST-invariant), not loop extents.
-  """
-  import os, math
-  dbg = os.environ.get('NPU_MATMUL_DEBUG') == '1'
-  params = sorted([u for u in uops if u.op is Ops.PARAM], key=lambda u: u.arg)
-  # v1: exactly 3 PARAMs (out, A, B). A 4th (bias) batched matmul -> defer to CPU for now.
-  if len(params) != 3 or [p.arg for p in params] != [0, 1, 2]: return None
-  out_p, a_p, b_p = params
-  out_dt, in_dt = out_p.dtype.base, a_p.dtype.base
-  if b_p.dtype.base != in_dt: return None
-  fn = _NPU_MATMUL.get((in_dt, out_dt))
-  if fn != "npu_matmul_fp16": return None          # v1: fp16 only (int8/bf16 deferred)
-
-  # Per-PARAM affine map {axis_uop: coeff}. AXES = loop/reduce RANGEs + symbolic DEFINE_VARs. The
-  # batch dim of a batched matmul appears as EITHER a RANGE (small kernels) OR the multicore `core_id`
-  # global DEFINE_VAR (once tinygrad maps batch onto the global dim — which it does at realistic
-  # attention sizes, already splitting batch across the 3 cores). Decomposing over RANGEs only makes
-  # core_id a non-substituted residual and the index reads "non-affine"; including DEFINE_VARs
-  # recovers it cleanly. A consistent coeff per axis is required across a PARAM's INDEX uops (UPCAST
-  # splits a dim into several loads but keeps the outer stride identical). Non-affine -> bail.
-  axes = [u for u in uops if u.op in (Ops.RANGE, Ops.DEFINE_VAR)]
-  def axis_extent(a):
-    if a.op is Ops.RANGE: return a.src[0].arg if a.src and a.src[0].op is Ops.CONST else None
-    return (a.arg[2] - a.arg[1] + 1) if (isinstance(a.arg, tuple) and len(a.arg) >= 3) else None
-  def param_strides(p):
-    acc = {}
-    idxs = [u for u in uops if u.op is Ops.INDEX and u.src[0] is p]
-    if not idxs: return None
-    for ix in idxs:
-      off = ix.src[1]
-      base = off.substitute({x: x.const_like(0) for x in axes}).simplify()
-      if base.op is not Ops.CONST: return None      # truly non-affine -> bail
-      for a in axes:
-        b = off.substitute({x: x.const_like(1 if x is a else 0) for x in axes}).simplify()
-        if b.op is not Ops.CONST: return None
-        c = b.arg - base.arg
-        if c == 0: continue
-        if a in acc and acc[a] != c: return None     # inconsistent stride for an axis -> bail
-        acc[a] = c
-    return acc
-  so, sa, sb = param_strides(out_p), param_strides(a_p), param_strides(b_p)
-  if so is None or sa is None or sb is None: return None
-
-  # Classify every axis that indexes any operand by its (out,A,B) membership.
-  allr = set(so) | set(sa) | set(sb)
-  batch_r = [r for r in allr if r in so and r in sa and r in sb]
-  n_r     = [r for r in allr if r in so and r in sb and r not in sa]   # N axis: out & B, not A
-  two_of_three = [r for r in allr if (r in so) + (r in sa) + (r in sb) == 2]
-  if not two_of_three:                             # pure element-wise (all axes hit all 3) -> not a matmul
-    if dbg: print("[bmm-match] reject: no 2-of-3 axis (element-wise, not a contraction)")
-    return None
-  if not batch_r:                                  # no all-3 axis -> not batched; let the 2D matcher try
-    return None
-  # Bh = product of all batch-axis extents. A batch dim can split into several axes — e.g. B>1 gives
-  # a RANGE for B and the core_id global for H, so Bh = 2 * 8 = 16 across two axes.
-  bext = [axis_extent(r) for r in batch_r]
-  if any(e is None or e < 1 for e in bext): return None
-  Bh = 1
-  for e in bext: Bh *= e
-  if Bh < 2: return None                           # Bh==1 is just a 2D matmul -> let the 2D matcher take it
-
-  # Per-slice size recovery: divide the batch factor out of the PARAM byte-sizes, then reuse the
-  # exact 2D factorization. (.dtype.size is element-count for the realized-half inputs we require.)
-  out_sz, a_sz, b_sz = out_p.dtype.size, a_p.dtype.size, b_p.dtype.size
-  if any(s < 1 or s % Bh != 0 for s in (out_sz, a_sz, b_sz)): return None
-  ps_o, ps_a, ps_b = out_sz // Bh, a_sz // Bh, b_sz // Bh
-  if (ps_a * ps_b) % ps_o != 0: return None
-  k_sq = (ps_a * ps_b) // ps_o
-  K = math.isqrt(k_sq)
-  if K * K != k_sq or K < 1: return None
-  if ps_a % K or ps_b % K: return None
-  M, N = ps_a // K, ps_b // K
-  if M * N != ps_o or M < 1 or N < 1: return None
-
-  # Contiguity cross-check (the guard against mis-recovery -> silent corruption): the batch axes must
-  # densely, nestedly tile each buffer with the per-slice block (M·N / M·K / K·N) as the innermost
-  # unit. Sort batch axes by stride and require each stride to equal the running block size; the final
-  # span must equal the whole buffer. This proves every slice is contiguous (-> pure pointer math) and
-  # that (Bh,M,K,N) is the true factorization. Holds for any number of batch axes (B>1 case).
-  def tiles(strides, slice_sz, total):
-    expect = slice_sz
-    for st, ext in sorted((strides[r], axis_extent(r)) for r in batch_r):
-      if st != expect: return False
-      expect *= ext
-    return expect == total
-  if not (tiles(so, M * N, out_sz) and tiles(sa, M * K, a_sz) and tiles(sb, K * N, b_sz)):
-    if dbg: print("[bmm-match] reject: batch axes do not tile contiguously (non-dense slices)")
-    return None
-
-  # Plain matmul only (v1): any fused select/compare/transcendental (relu, sigmoid, ...) -> CPU.
-  if _matmul_epilogue(uops) != 'plain':
-    if dbg: print("[bmm-match] reject: fused epilogue (v1 is plain-only) -> CPU")
-    return None
-
-  # B layout per slice: for q@kᵀ (k contiguous [.,T,d]) the slice is [N,K] (N strided by K, K
-  # contiguous) -> pre-transposed `_bt` fast path; for attn@v / a materialized [K,N] the slice is
-  # [K,N] (N contiguous) -> normal pack. Decide from the N axis's stride in B. Under UPCAST the N
-  # axis carries only the OUTER factor, so its B-stride is (inner_unroll x per-element-N-stride):
-  # for [N,K] that is a multiple of K (>= K); for [K,N] it is the small inner-unroll width (< K).
-  layout = 'kn'
-  if N > 1:
-    if not n_r:                                    # N fully unrolled and ambiguous -> be safe, reject
-      if dbg: print("[bmm-match] reject: no N axis to disambiguate B layout")
-      return None
-    nstride_b = min(sb[r] for r in n_r)            # smallest N step in B
-    layout = 'nk' if (nstride_b >= K and nstride_b % K == 0) else 'kn'
-  if layout == 'nk':
-    fn = 'npu_matmul_fp16_bt'
-
-  # Per-slice CBUF tile feasibility (mirror _try_match_matmul's envelope). K-tiling is future work;
-  # a slice that cannot fit one CBUF pass -> CPU.
-  elem_bytes = 2
-  K_pad = ((K + 31) // 32) * 32
-  CBUF_BANK, CBUF_BANKS_USABLE = 32768, 11
-  if K_pad * elem_bytes > CBUF_BANK: return None
-  weight_banks_min = (K_pad * 16 * elem_bytes + CBUF_BANK - 1) // CBUF_BANK
-  data_banks_avail = CBUF_BANKS_USABLE - weight_banks_min
-  Mt_floor = 1 if M == 1 else 4
-  if data_banks_avail < 1 or Mt_floor * K_pad * elem_bytes > data_banks_avail * CBUF_BANK:
-    return None
-
-  if dbg: print(f"[bmm-match] Bh={Bh} M={M} K={K} N={N} fn={fn} layout={layout} "
-                f"(batch strides out={[so[r] for r in batch_r]} a={[sa[r] for r in batch_r]} b={[sb[r] for r in batch_r]})")
-  return {'Bh': Bh, 'M': M, 'K': K, 'N': N, 'fn': fn, 'layout': layout,
-          'bs_out': M * N, 'bs_a': M * K, 'bs_b': K * N}
 
 def _try_match_reduce(uops):
   """Return (M, K) if this kernel is a pure SUM-reduce of an fp16 tensor over its contiguous
@@ -829,7 +339,7 @@ def _try_match_conv(uops):
   Safety: a candidate (Cin, IW, KW) factorization is accepted ONLY if the exact set of input bytes
   it would read equals what the kernel actually reads, so a non-conv (or wrong geometry) can never
   mis-dispatch — important because a wrong `elements`/geometry on this NPU is an OOB DMA that wedges
-  the SoC. KH=KW=1 collapses to the matmul lowering and is left to _try_match_matmul. Out of scope
+  the SoC. KH=KW=1 collapses to the matmul lowering and is left to the matmul path (_sched_match_matmul). Out of scope
   (returns None -> CPU fallback): dilation!=1, padding!=0, groups!=1, bias, non-fp16.
 
   NOTE: not yet wired into render() — that pairs with adding an `npu_conv_fp16` CNA entry point
@@ -946,7 +456,7 @@ def _try_match_conv(uops):
           # npu_conv_fp16 mis-computes it (e.g. a plain M×K@K×N matmul whose K-contraction
           # happens to factor as Cin·KH gives N=M images, Cout=N_matmul, OH=OW=1 -> garbage,
           # the 400×64×8192 bug). A real conv reduces here only when it slides (OH>1 or OW>1);
-          # the matmul-equivalent case is left to _try_match_matmul. (_conv_signature won't
+          # the matmul-equivalent case is left to _sched_match_matmul. (_conv_signature won't
           # block that fallthrough: a matmul's contraction coeff is <=16, not the >16 spatial
           # channel stride it keys on.)
           if pred == actual and not (OH == 1 and OW == 1):
@@ -956,7 +466,7 @@ def _try_match_conv(uops):
 
 def _conv_signature(uops):
   """True if the kernel is conv-shaped — used to stop a conv that _try_match_conv couldn't parse from
-  being mis-grabbed by _try_match_matmul (which size-factors it into a bogus matmul -> silent garbage).
+  being mis-grabbed by the matmul path (KH=KW=1 -> _sched_match_matmul handles it directly).
   Signal: the INPUT (param1) has a REDUCE range with coefficient > 16 (= the channel stride IH*IW). A
   matmul's contraction is contiguous/vectorized in its input (coeff = 1 or the vector width, <= 16), so
   it never trips this; a spatial conv's cin stride IH*IW is large. (The weight param can't be used —
@@ -1014,7 +524,8 @@ class RkRenderer(ClangJITRenderer):
     # geometry from the input PARAM's windowed index (None for 1x1 -> matmul, and for
     # dilation/padding/groups/non-fp16). PARAMs emit in arg order: 0=output, 1=input, 2=weight.
     # Route the whole kernel to one npu_conv_fp16() (fp16 output, matching tinygrad's fp16 conv).
-    cv = _try_match_conv(uops)
+    # Skip when a matmul annotation exists (a matmul is never a conv) — avoids redundant archaeology.
+    cv = None if _sched_ann_current is not None else _try_match_conv(uops)
     if cv is not None:
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
@@ -1049,13 +560,11 @@ class RkRenderer(ClangJITRenderer):
       return super().render(uops)
 
     # *** Batched matmul fast path (attention q@kᵀ / attn@v, [B,H,T,·]) ***
-    # The 2D matcher rejects these (a batch dim inflates the size factorization so isqrt(K²) fails).
-    # _try_match_batched_matmul recovers (Bh,M,K,N,layout); each batch slice is contiguous, so emit a
-    # C loop over the Bh slices, one npu_matmul_fp16(_bt) call each at a pointer offset. Force
-    # threads=1 (add to _npu_kernel_names) so the loop runs exactly once and covers every slice.
-    # (Multicore distribution is deferred: the batch is already mapped to core_id, but a serial loop
-    # is the correct v1 — see the batched-matmul-recovery memory note.)
-    bmm = _try_match_batched_matmul(uops)
+    # Bh>1 branch of the schedule-level match stashed by the get_runner hook (_sched_ann_current).
+    # The Bh slices are contiguous, so one npu_matmul_fp16_batched() builds+submits all tiles in a
+    # single chained, multicore ioctl. (No post-linearize matcher: the schedule AST gives Bh/M/K/N/
+    # layout directly — see the _sched_match_matmul block below.)
+    bmm = _sched_ann_current if (_sched_ann_current is not None and _sched_ann_current['Bh'] > 1) else None
     if bmm is not None:
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
@@ -1076,13 +585,12 @@ class RkRenderer(ClangJITRenderer):
         return self.render_kernel(name, body, bufs, uops)
 
     # *** Matmul fast path ***
-    # tinygrad lowers `a @ b` to a reduce-loop kernel named "r_M_N_K" (with ANSI color codes).
-    # When the AST contains: 3 PARAMs (output, A, B) with ptr sizes M*N / M*K / K*N, one
-    # STORE, a REDUCE_AXIS or RANGE loop, and the output dtype is in _NPU_MATMUL, redirect
-    # the whole kernel to a single npu_matmul_<dtype>() call. A 4th PARAM that is a per-channel
-    # bias vector (a@b + bias[n], e.g. nn.Linear) is folded via pcbias (fp16 wrappers only).
-    # Otherwise fall through to the element-wise path / CPU.
-    mm = _try_match_matmul(uops)
+    # Bh==1 branch of the schedule-level match (_sched_ann_current). Emits one npu_matmul_<dtype>()
+    # for the whole kernel: (M,K,N), dtype/fn, fused relu/silu, and a per-channel bias (a@b+bias[n],
+    # e.g. nn.Linear) folded via pcbias — all recovered by _sched_match_matmul from the schedule AST.
+    # No annotation (not a matmul, or shape the matcher rejects) -> fall through to reduce/EW/CPU.
+    a = _sched_ann_current
+    mm = (a['M'], a['N'], a['K'], a['fn'], a['relu'], a['bias_pidx']) if (a is not None and a['Bh'] == 1) else None
     if mm is not None:
       M, N, K, fn, relu, bias_pidx = mm
       name, _kernel, bufs = self._render(uops)
@@ -1093,7 +601,7 @@ class RkRenderer(ClangJITRenderer):
         i_out, i_A, i_B = ptr_indices[0], ptr_indices[1], ptr_indices[2]
         pre = []
         # pcbias: the wrapper reads a host fp32 array[N] during weight packing. The bias PARAM is fp16
-        # (matched in _validate_bias), so upcast it into a stack temp here (N is a compile-time literal).
+        # (validated in _sched_match_matmul), so upcast it into a stack temp here (N is a compile-time literal).
         if bias_pidx is not None:
           i_bias = ptr_indices[3]
           pre = [f"  float npu_pcbias[{N}];",
@@ -1325,6 +833,176 @@ class RKNPUSignal(CPUSignal):
       if self.owner.error_state is not None: raise self.owner.error_state
 
 
+# ============================================================================
+# Schedule-level matmul dispatch (get_runner hook)
+#
+# The schedule matcher below recovers (M,K,N,layout) cleanly from the pre-opt AST, unlike the
+# POST-linearize uop list by byte-size archaeology (isqrt over PARAM sizes, affine-coeff permute
+# proofs) because tinygrad's opt passes have destroyed the loop structure by render time. This hook
+# matches the SAME matmuls one stage earlier — on the schedule-form AST, where a matmul is still
+# REDUCE(MUL(A.index, B.index), Krange, ADD) with tiny affine coeffs, so M/K/N are range extents and
+# layout is a coeff read. No isqrt, no square-EW/permuted-A guards. It intercepts get_runner (which
+# exec_kernel and jit both call to turn a kernel AST into a Runner) and returns an NpuMatmulRunner
+# that calls npu_matmul_*() directly (VA + zero dma, exactly like RKNPUComputeQueue._rknpu_exec).
+# 2D + batched, fp16/int8, plain/relu/silu/per-channel-bias. Anything it can't prove -> None ->
+# old post-linearize byte-size reconstruction (isqrt/permute proofs), now deleted.
+#
+# ANNOTATE -> EMIT (JIT-safe): the hook does NOT return a bespoke runner (that broke TinyJit/HCQGraph
+# — a plain Runner can't be graph-captured/VA-patched). Instead it STASHES the schedule match in
+# `_sched_ann_current` and lets the normal compile path run; RkRenderer.render() reads the stash and
+# emits its usual C npu_matmul() call from those params, skipping the render-time archaeology. The
+# result is the SAME CompiledRunner render always produced -> HCQGraph captures it, JIT replay is
+# faithful. The clean schedule match is just a better SOURCE of (M,K,N,layout,epilogue,bias) than the
+# post-linearize isqrt/permute reconstruction. Kill-switch: NPU_NO_SCHED_MATMUL=1.
+# ============================================================================
+import tinygrad.engine.realize as _realize
+
+_SILU_C_SCHED = -1.4426950408889634   # -log2(e)
+_sched_ann_current = None             # schedule match for the kernel currently being rendered (or None)
+
+def _sched_range_ext(r): return r.src[0].arg if r.src and r.src[0].op is Ops.CONST else None
+def _sched_is_reduce(r): return r.op is Ops.RANGE and len(r.arg) > 1 and r.arg[-1] is AxisType.REDUCE
+
+def _sched_peel_epilogue(val):
+  """(epilogue, bias_index_node, reduce_node) from a matmul store value, or (None,None,None).
+  Peels relu (max/where) -> silu (x*recip(1+exp2(x*C))) -> per-channel bias ADD, all structurally
+  on the clean schedule nodes. reduce_node is the REDUCE feeding the accumulator."""
+  epi, bias, v = 'plain', None, _strip_cast(val)
+  zc = lambda u: u.op is Ops.CONST and u.arg == 0
+  if v.op is Ops.MAX and len(v.src) == 2 and any(zc(s) for s in v.src):
+    epi = 'relu'; v = _strip_cast(next(s for s in v.src if not zc(s)))
+  elif v.op is Ops.WHERE and len(v.src) == 3 and v.src[0].op is Ops.CMPLT \
+       and zc(v.src[0].src[0]) and v.src[1] is v.src[0].src[1] and zc(v.src[2]):
+    epi = 'relu'; v = _strip_cast(v.src[1])
+  if v.op is Ops.MUL and len(v.src) == 2:
+    x, rc = v.src
+    if rc.op is not Ops.RECIPROCAL: x, rc = rc, x
+    if rc.op is Ops.RECIPROCAL and rc.src[0].op is Ops.ADD:
+      add = rc.src[0]
+      ones = [s for s in add.src if s.op is Ops.CONST and abs(s.arg - 1.0) < 1e-6]
+      exps = [s for s in add.src if s.op is Ops.EXP2]
+      if len(ones) == 1 and len(exps) == 1 and exps[0].src[0].op is Ops.MUL:
+        mul = exps[0].src[0]
+        cs = [s for s in mul.src if s.op is Ops.CONST and abs(s.arg - _SILU_C_SCHED) < 1e-3]
+        xs = [s for s in mul.src if not (s.op is Ops.CONST and abs(s.arg - _SILU_C_SCHED) < 1e-3)]
+        if len(cs) == 1 and len(xs) == 1 and _strip_cast(xs[0]) is _strip_cast(x):
+          if epi == 'relu': return None, None, None
+          epi = 'silu'; v = _strip_cast(x)
+  if v.op is Ops.ADD and len(v.src) == 2:
+    reds = [s for s in v.src if _strip_cast(s).op is Ops.REDUCE]
+    others = [s for s in v.src if _strip_cast(s).op is not Ops.REDUCE]
+    if len(reds) == 1 and len(others) == 1 and others[0].op is Ops.INDEX and others[0].src[0].op is Ops.PARAM:
+      bias = others[0]; v = _strip_cast(reds[0])
+  if v.op is not Ops.REDUCE: return None, None, None
+  return epi, bias, v
+
+def _sched_match_matmul(sink):
+  """Return dict(Bh,M,K,N,fn,relu,weight_t,bias_pidx,order,in_dt) if `sink` is a schedule-form
+  matmul the runtime can run, else None. Mirrors the render-path dtype routing + CBUF feasibility."""
+  stores = [u for u in sink.toposort() if u.op is Ops.STORE]
+  if len(stores) != 1: return None
+  out_idx, val = stores[0].src[0], stores[0].src[1]
+  epi, bias, red = _sched_peel_epilogue(val)
+  if epi is None or red.arg is not Ops.ADD: return None
+  red_ranges = [s for s in red.src[1:] if s.op is Ops.RANGE]
+  if not red_ranges: return None
+  body = _strip_cast(red.src[0])
+  if body.op is not Ops.MUL or len(body.src) != 2: return None
+  ia, ib = body.src
+  if ia.op is not Ops.INDEX or ib.op is not Ops.INDEX: return None
+  if ia.src[0].op is not Ops.PARAM or ib.src[0].op is not Ops.PARAM: return None
+  a_p, b_p = ia.src[0], ib.src[0]
+  ra, rb, ro = _affine_offset(ia.src[1]), _affine_offset(ib.src[1]), _affine_offset(out_idx.src[1])
+  if ra is None or rb is None or ro is None: return None
+  ac, bc, oc = ra[1], rb[1], ro[1]
+  loops = [r for r in set(ac) | set(bc) if not _sched_is_reduce(r)]
+  m_axes = [r for r in loops if ac.get(r, 0) != 0 and bc.get(r, 0) == 0]
+  n_axes = [r for r in loops if bc.get(r, 0) != 0 and ac.get(r, 0) == 0]
+  batch  = [r for r in loops if ac.get(r, 0) != 0 and bc.get(r, 0) != 0]
+  if len(m_axes) != 1 or len(n_axes) != 1: return None
+  mr, nr = m_axes[0], n_axes[0]
+  M, N = _sched_range_ext(mr), _sched_range_ext(nr)
+  if M is None or N is None: return None
+  Bh = 1
+  for r in batch:
+    e = _sched_range_ext(r)
+    if e is None or e < 1: return None
+    Bh *= e
+  # K may be a SINGLE reduce axis (plain a@b) or SEVERAL (a multi-axis contraction, e.g. einsum
+  # 'mkl,kln->mn'). Either way the runtime needs one flattened K, which is valid iff the reduce axes
+  # form a CONTIGUOUS run in A (innermost stride 1, each next = product of previous extents) — then
+  # K = product of extents. Order the axes by their A-stride and verify the flatten.
+  ks = sorted(red_ranges, key=lambda r: ac.get(r, 0))
+  K, stride = 1, 1
+  for r in ks:
+    e = _sched_range_ext(r)
+    if e is None or e < 1 or ac.get(r, 0) != stride: return None                # non-contiguous K in A
+    K *= e; stride *= e
+  if ac.get(mr) != K: return None                                              # A must be packed [M,K]
+  # B: kn -> every k-stride is N× its A-stride and N is innermost (bc[n]==1);
+  #    nk -> every k-stride equals its A-stride (contiguous [.,K]) and bc[n]==K.
+  if   bc.get(nr) == 1 and all(bc.get(r, 0) == N * ac.get(r, 0) for r in ks): layout = 'kn'
+  elif bc.get(nr) == K and all(bc.get(r, 0) == ac.get(r, 0) for r in ks):     layout = 'nk'
+  else: return None
+  for r in batch:                                                             # contiguous batch slices
+    if ac.get(r, 0) % (M * K) or bc.get(r, 0) % (K * N) or oc.get(r, 0) % (M * N): return None
+
+  out_dt, in_dt = out_idx.src[0].dtype.base, a_p.dtype.base
+  if b_p.dtype.base is not in_dt: return None
+  fn = _NPU_MATMUL.get((in_dt, out_dt))
+  if fn is None: return None
+  relu = 1 if epi == 'relu' else 0
+  # CBUF feasibility: K_pad column must fit one bank + room for one Mt slab (else the wrapper can't tile)
+  elem_bytes = 2 if in_dt in (dtypes.half, dtypes.bfloat16) else 1
+  N_align, K_pad = (16 if elem_bytes == 2 else 32), ((K + 31) // 32) * 32
+  CBUF_BANK, USABLE = 32768, 11
+  if K_pad * elem_bytes > CBUF_BANK: return None
+  wb_min = (K_pad * N_align * elem_bytes + CBUF_BANK - 1) // CBUF_BANK
+  avail = USABLE - wb_min
+  if avail < 1: return None
+  if (1 if M == 1 else 4) * K_pad * elem_bytes > avail * CBUF_BANK: return None
+
+  if Bh > 1:
+    if fn != 'npu_matmul_fp16' or bias is not None or epi == 'silu': return None   # batched: fp16 plain/relu
+  else:
+    if layout == 'nk':
+      fn = {'npu_matmul_fp16': 'npu_matmul_fp16_bt', 'npu_matmul_int8': 'npu_matmul_int8_bt'}.get(fn)
+      if fn is None: return None
+  bias_pidx = None
+  if bias is not None:
+    if fn not in ('npu_matmul_fp16', 'npu_matmul_fp16_bt') or Bh > 1: return None
+    rbias = _affine_offset(bias.src[1])
+    if rbias is None or rbias[0] != 0: return None
+    if any(c != 0 and r is not nr for r, c in rbias[1].items()) or rbias[1].get(nr, 0) != 1: return None
+    if bias.src[0].dtype.base is not dtypes.half or bias.src[0].dtype.size != N: return None
+    bias_pidx = bias.src[0].arg
+  if epi == 'silu':
+    if fn != 'npu_matmul_fp16' or bias_pidx is not None or (M * N) % 8 != 0 or Bh > 1: return None
+    fn = 'npu_matmul_fp16_silu'
+  return dict(Bh=Bh, M=M, N=N, K=K, fn=fn, relu=relu, bias_pidx=bias_pidx, layout=layout)
+
+_sched_cache: dict = {}
+_sched_installed = [False]
+def _install_sched_matmul():
+  if _sched_installed[0] or os.environ.get('NPU_NO_SCHED_MATMUL'): return
+  _sched_installed[0] = True
+  _orig_get_runner = _realize.get_runner
+  def _hooked_get_runner(device, ast):
+    # Compute the schedule-level match here (only place with the pre-opt AST), stash it, then let the
+    # normal compile+render path build the CompiledRunner — render() reads _sched_ann_current.
+    global _sched_ann_current
+    if device.split(":")[0] == "RKNPU":
+      sink = ast.src[0] if ast.op is Ops.BEAM else ast
+      if sink.op is Ops.SINK:
+        ckey = (device, sink.key)
+        if ckey not in _sched_cache: _sched_cache[ckey] = _sched_match_matmul(sink)
+        _sched_ann_current = _sched_cache[ckey]
+        try: return _orig_get_runner(device, ast)     # render() consumes _sched_ann_current on cache-miss
+        finally: _sched_ann_current = None
+    return _orig_get_runner(device, ast)
+  _realize.get_runner = _hooked_get_runner
+
+
 class RKNPUDevice(HCQCompiled):
   _shared_fd: int = -1
   _fd_refcount: int = 0
@@ -1361,6 +1039,7 @@ class RKNPUDevice(HCQCompiled):
       RKNPUComputeQueue,
       RKNPUCopyQueue,
     )
+    _install_sched_matmul()   # intercept matmul kernels at schedule time (get_runner hook)
 
   def finalize(self):
     super().finalize()
