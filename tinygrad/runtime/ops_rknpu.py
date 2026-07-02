@@ -524,8 +524,11 @@ class RkRenderer(ClangJITRenderer):
     # geometry from the input PARAM's windowed index (None for 1x1 -> matmul, and for
     # dilation/padding/groups/non-fp16). PARAMs emit in arg order: 0=output, 1=input, 2=weight.
     # Route the whole kernel to one npu_conv_fp16() (fp16 output, matching tinygrad's fp16 conv).
-    # Skip when a matmul annotation exists (a matmul is never a conv) — avoids redundant archaeology.
-    cv = None if _sched_ann_current is not None else _try_match_conv(uops)
+    # Schedule-level conv match (stashed by the hook) is authoritative when present; otherwise fall
+    # back to the render-path _try_match_conv. A matmul annotation means this is not a conv (-> None).
+    _ann = _sched_ann_current
+    cv = (_ann if (_ann is not None and _ann.get('kind') == 'conv') else None) if _ann is not None \
+         else _try_match_conv(uops)
     if cv is not None:
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
@@ -564,7 +567,8 @@ class RkRenderer(ClangJITRenderer):
     # The Bh slices are contiguous, so one npu_matmul_fp16_batched() builds+submits all tiles in a
     # single chained, multicore ioctl. (No post-linearize matcher: the schedule AST gives Bh/M/K/N/
     # layout directly — see the _sched_match_matmul block below.)
-    bmm = _sched_ann_current if (_sched_ann_current is not None and _sched_ann_current['Bh'] > 1) else None
+    bmm = _sched_ann_current if (_sched_ann_current is not None and _sched_ann_current.get('kind') == 'matmul'
+                                 and _sched_ann_current['Bh'] > 1) else None
     if bmm is not None:
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
@@ -590,7 +594,8 @@ class RkRenderer(ClangJITRenderer):
     # e.g. nn.Linear) folded via pcbias — all recovered by _sched_match_matmul from the schedule AST.
     # No annotation (not a matmul, or shape the matcher rejects) -> fall through to reduce/EW/CPU.
     a = _sched_ann_current
-    mm = (a['M'], a['N'], a['K'], a['fn'], a['relu'], a['bias_pidx']) if (a is not None and a['Bh'] == 1) else None
+    mm = (a['M'], a['N'], a['K'], a['fn'], a['relu'], a['bias_pidx']) \
+         if (a is not None and a.get('kind') == 'matmul' and a['Bh'] == 1) else None
     if mm is not None:
       M, N, K, fn, relu, bias_pidx = mm
       name, _kernel, bufs = self._render(uops)
@@ -979,7 +984,61 @@ def _sched_match_matmul(sink):
   if epi == 'silu':
     if fn != 'npu_matmul_fp16' or bias_pidx is not None or (M * N) % 8 != 0 or Bh > 1: return None
     fn = 'npu_matmul_fp16_silu'
-  return dict(Bh=Bh, M=M, N=N, K=K, fn=fn, relu=relu, bias_pidx=bias_pidx, layout=layout)
+  return dict(kind='matmul', Bh=Bh, M=M, N=N, K=K, fn=fn, relu=relu, bias_pidx=bias_pidx, layout=layout)
+
+def _sched_match_conv(sink):
+  """Schedule-form conv2d match -> dict(kind='conv', N,Cin,IH,IW,Cout,KH,KW,sh,sw) or None.
+  NCHW geometry is direct affine-coeff reads (IW=coeff_in(KH), sw=coeff_in(OW), sh=coeff_in(OH)/IW,
+  IH=coeff_in(Cin)/IW; reduce axes sorted by input-stride -> KW,KH,Cin; loops by output-stride ->
+  OW,OH,N,Cout). fp16 only, dilation=1, no padding/groups, KH*KW>1 (1x1 -> matmul), no fused
+  epilogue (npu_conv_fp16 has no relu/bias). Emitted params match the render conv fast path's `g`."""
+  stores = [u for u in sink.toposort() if u.op is Ops.STORE]
+  if len(stores) != 1: return None
+  out_idx, val = stores[0].src[0], stores[0].src[1]
+  v = _strip_cast(val)
+  if v.op is not Ops.REDUCE or v.arg is not Ops.ADD: return None       # no fused epilogue for conv
+  red = [s for s in v.src[1:] if s.op is Ops.RANGE]
+  if len(red) != 3: return None                                        # Cin,KH,KW (1x1->matmul; dil/groups differ)
+  body = _strip_cast(v.src[0])
+  if body.op is not Ops.MUL or len(body.src) != 2: return None         # a padding mask breaks the pure MUL
+  ia, ib = body.src
+  if ia.op is not Ops.INDEX or ib.op is not Ops.INDEX: return None
+  if ia.src[0].op is not Ops.PARAM or ib.src[0].op is not Ops.PARAM: return None
+  if any(x.dtype.base is not dtypes.half for x in (out_idx.src[0], ia.src[0], ib.src[0])): return None
+  ra, rb, ro = _affine_offset(ia.src[1]), _affine_offset(ib.src[1]), _affine_offset(out_idx.src[1])
+  if ra is None or rb is None or ro is None: return None
+  ac, bc, oc = ra[1], rb[1], ro[1]
+  loops = [r for r in set(ac) | set(bc) if not _sched_is_reduce(r)]
+  a_loops, b_loops = [r for r in loops if ac.get(r, 0)], [r for r in loops if bc.get(r, 0)]
+  if   len(a_loops) == 1 and len(b_loops) > 1: w_i, in_i, wc, inc, cout_r = ia, ib, ac, bc, a_loops[0]
+  elif len(b_loops) == 1 and len(a_loops) > 1: w_i, in_i, wc, inc, cout_r = ib, ia, bc, ac, b_loops[0]
+  else: return None                                                    # weight = operand indexed by 1 loop (Cout)
+  in_loops = [r for r in loops if r is not cout_r]
+  ow_r = next((r for r in in_loops if oc.get(r) == 1), None)           # OW: output stride 1
+  if ow_r is None: return None
+  OW = _sched_range_ext(ow_r)
+  oh_r = next((r for r in in_loops if oc.get(r) == OW), None)          # OH: output stride OW
+  if oh_r is None: return None
+  OH, Cout = _sched_range_ext(oh_r), _sched_range_ext(cout_r)
+  if OW is None or OH is None or Cout is None: return None
+  n_r = next((r for r in in_loops if oc.get(r) == Cout * OH * OW), None)   # N (batch): optional
+  N = _sched_range_ext(n_r) if n_r is not None else 1
+  if oc.get(cout_r) != OH * OW: return None
+  if {ow_r, oh_r} | ({n_r} if n_r is not None else set()) != set(in_loops): return None  # no stray loop
+  kw_r, kh_r, cin_r = sorted(red, key=lambda r: inc.get(r, 0))         # by input stride: KW(1),KH(IW),Cin(IH*IW)
+  IW, Cin, KW, KH = inc.get(kh_r), _sched_range_ext(cin_r), _sched_range_ext(kw_r), _sched_range_ext(kh_r)
+  if IW is None or IW < 1 or Cin is None or KW is None or KH is None: return None
+  if inc.get(kw_r) != 1 or inc.get(cin_r) % IW: return None            # dilation_w!=1 / bad Cin stride
+  IH = inc.get(cin_r) // IW
+  sw, sh_num = inc.get(ow_r), inc.get(oh_r)
+  if sw is None or sh_num is None or sh_num % IW: return None
+  sh = sh_num // IW
+  # soundness: weight is [Cout,Cin,KH,KW] and the remaining input strides are consistent
+  if wc.get(kw_r) != 1 or wc.get(kh_r) != KW or wc.get(cin_r) != KH * KW or wc.get(cout_r) != Cin * KH * KW: return None
+  if inc.get(oh_r) != sh * IW or inc.get(cin_r) != IH * IW: return None
+  if n_r is not None and inc.get(n_r) != Cin * IH * IW: return None
+  if KH * KW <= 1: return None                                         # 1x1 is a matmul
+  return dict(kind='conv', N=N, Cin=Cin, IH=IH, IW=IW, Cout=Cout, KH=KH, KW=KW, sh=sh, sw=sw)
 
 _sched_cache: dict = {}
 _sched_installed = [False]
@@ -995,7 +1054,7 @@ def _install_sched_matmul():
       sink = ast.src[0] if ast.op is Ops.BEAM else ast
       if sink.op is Ops.SINK:
         ckey = (device, sink.key)
-        if ckey not in _sched_cache: _sched_cache[ckey] = _sched_match_matmul(sink)
+        if ckey not in _sched_cache: _sched_cache[ckey] = _sched_match_matmul(sink) or _sched_match_conv(sink)
         _sched_ann_current = _sched_cache[ckey]
         try: return _orig_get_runner(device, ast)     # render() consumes _sched_ann_current on cache-miss
         finally: _sched_ann_current = None
