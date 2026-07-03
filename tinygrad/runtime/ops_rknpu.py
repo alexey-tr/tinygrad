@@ -126,7 +126,7 @@ for _fn in ['npu_matmul_fp16', 'npu_matmul_bf16', 'npu_matmul_int8', 'npu_matmul
                                  ctypes.c_void_p, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_uint64,
                                  ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float,
-                                 ctypes.c_void_p]
+                                 ctypes.c_void_p, ctypes.c_float]
 
 # void npu_matmul_fp16_batched(int fd, void* dst_va, u64 dst_dma, u64 dst_obj, const void* a_va, u64 a_dma,
 #   const void* b_va, u64 b_dma, int batch, int M, int K, int N, int weight_t, int relu)
@@ -444,27 +444,23 @@ class RkRenderer(ClangJITRenderer):
                  f"  for (int _i = 0; _i < {N}; _i++) "
                  f"npu_pcbias[_i] = (float)((const __fp16*){bufs[i_bias][0]})[_i];"]
         bias_arg = "npu_pcbias" if bias_pidx is not None else "(const float*)0"
-        # A scalar bias-add (a@b + c) fuses into the wrapper's `float bias` slot -> DPU BS ALU (proven).
+        # Scalar epilogues fuse fully on-NPU, no extra op/DMA: (a@b)+c -> the wrapper's `float bias`
+        # slot (DPU BS ALU add); (a@b)*c -> the trailing `float scale` (DPU BN MUL, operand = fp16
+        # bits<<16, RE'd from RKNN; see vitals/bs_mul_probe.c). BS(bias/relu) runs before BN(scale),
+        # and the matcher gates scale>0 with relu so relu(x)*c == relu(x*c).
         npu_call = (f"{fn}(npu_fd, "
                 f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
                 f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
                 f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
-                f"{M}, {K}, {N}, {relu}, {bias_const!r}f, {bias_arg})")
-        # A scalar output-scale ((a@b)*c) is applied as a cheap post-multiply over the [M,N] fp16
-        # output (the DPU BS/BN MUL stages don't do an fp32 float multiply here). The point of peeling
-        # it in the matcher is to keep the M*K*N matmul on the NPU instead of dumping the whole kernel
-        # to the CPU; the O(M*N) scale is the same pass tinygrad would have run anyway. relu is fused
-        # pre-output, so relu(x)*c == relu(x*c) for the c>0 the matcher accepts.
-        post = ([f"  for (int _s = 0; _s < {M*N}; _s++) ((__fp16*){bufs[i_out][0]})[_s] *= {scale!r}f;"]
-                if scale != 1.0 else [])
+                f"{M}, {K}, {N}, {relu}, {bias_const!r}f, {bias_arg}, {scale!r}f)")
         # For multicore kernels (global_size>1 → core_id param), the runner calls the
         # C function once per thread. The NPU computes the full result in one call, so
         # guard with core_id==0 to avoid redundant/overwriting launches.
         has_core_id = any(bname == 'core_id' for bname, _ in bufs)
         if has_core_id:
-          body = pre + [f"  if (core_id == 0) {{ {npu_call}; {' '.join(s.strip() for s in post)} }}"]
+          body = pre + [f"  if (core_id == 0) {{ {npu_call}; }}"]
         else:
-          body = pre + [f"  {npu_call};"] + post
+          body = pre + [f"  {npu_call};"]
         self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
@@ -528,14 +524,14 @@ class RkRenderer(ClangJITRenderer):
       'void npu_max_scalar_i16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, short scalar, int elements);',
       'void npu_max_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long srcA_dma, unsigned long long srcB_dma, int elements);',
       'void npu_max_scalar_bf16(int fd, unsigned long long dst_dma, unsigned long long dst_obj, unsigned long long src_dma, __bf16 scalar, int elements);',
-      'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
-      'void npu_matmul_fp16_silu(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
-      'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
-      'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
+      'void npu_matmul_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
+      'void npu_matmul_fp16_silu(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
+      'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
+      'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
       'void npu_matmul_fp16_batched(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int batch, int M, int K, int N, int weight_t, int relu);',
       'void npu_conv_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *feat_va, unsigned long long feat_dma, const void *weight_va, unsigned long long weight_dma, int N, int Cin, int IH, int IW, int Cout, int KH, int KW, int sh, int sw, int fp16_out);',
-      'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
-      'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias);',
+      'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
+      'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
       'void npu_max_lastaxis_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *src_va, unsigned long long src_dma, int M, int K);',
       'void npu_sum_lastaxis_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *src_va, unsigned long long src_dma, int M, int K);',
     ]
