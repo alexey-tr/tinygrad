@@ -425,10 +425,10 @@ class RkRenderer(ClangJITRenderer):
     # e.g. nn.Linear) folded via pcbias — all recovered by _sched_match_matmul from the schedule AST.
     # No annotation (not a matmul, or shape the matcher rejects) -> fall through to reduce/EW/CPU.
     a = _sched_ann_current
-    mm = (a['M'], a['N'], a['K'], a['fn'], a['relu'], a['bias_pidx']) \
+    mm = (a['M'], a['N'], a['K'], a['fn'], a['relu'], a['bias_pidx'], a.get('scale', 1.0), a.get('bias_const', 0.0)) \
          if (a is not None and a.get('kind') == 'matmul' and a['Bh'] == 1) else None
     if mm is not None:
-      M, N, K, fn, relu, bias_pidx = mm
+      M, N, K, fn, relu, bias_pidx, scale, bias_const = mm
       name, _kernel, bufs = self._render(uops)
       ptr_indices = [i for i, (_, (dtype, _)) in enumerate(bufs) if isinstance(dtype, PtrDType)]
       # PARAMs emit to bufs in arg order: 0=output, 1=A, 2=B, (3=per-channel bias) (verified via probe).
@@ -444,19 +444,27 @@ class RkRenderer(ClangJITRenderer):
                  f"  for (int _i = 0; _i < {N}; _i++) "
                  f"npu_pcbias[_i] = (float)((const __fp16*){bufs[i_bias][0]})[_i];"]
         bias_arg = "npu_pcbias" if bias_pidx is not None else "(const float*)0"
+        # A scalar bias-add (a@b + c) fuses into the wrapper's `float bias` slot -> DPU BS ALU (proven).
         npu_call = (f"{fn}(npu_fd, "
                 f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
                 f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
                 f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
-                f"{M}, {K}, {N}, {relu}, 0.0f, {bias_arg})")
+                f"{M}, {K}, {N}, {relu}, {bias_const!r}f, {bias_arg})")
+        # A scalar output-scale ((a@b)*c) is applied as a cheap post-multiply over the [M,N] fp16
+        # output (the DPU BS/BN MUL stages don't do an fp32 float multiply here). The point of peeling
+        # it in the matcher is to keep the M*K*N matmul on the NPU instead of dumping the whole kernel
+        # to the CPU; the O(M*N) scale is the same pass tinygrad would have run anyway. relu is fused
+        # pre-output, so relu(x)*c == relu(x*c) for the c>0 the matcher accepts.
+        post = ([f"  for (int _s = 0; _s < {M*N}; _s++) ((__fp16*){bufs[i_out][0]})[_s] *= {scale!r}f;"]
+                if scale != 1.0 else [])
         # For multicore kernels (global_size>1 → core_id param), the runner calls the
         # C function once per thread. The NPU computes the full result in one call, so
         # guard with core_id==0 to avoid redundant/overwriting launches.
         has_core_id = any(bname == 'core_id' for bname, _ in bufs)
         if has_core_id:
-          body = pre + [f"  if (core_id == 0) {{ {npu_call}; }}"]
+          body = pre + [f"  if (core_id == 0) {{ {npu_call}; {' '.join(s.strip() for s in post)} }}"]
         else:
-          body = pre + [f"  {npu_call};"]
+          body = pre + [f"  {npu_call};"] + post
         self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
@@ -700,10 +708,12 @@ def _sched_range_ext(r): return r.src[0].arg if r.src and r.src[0].op is Ops.CON
 def _sched_is_reduce(r): return r.op is Ops.RANGE and len(r.arg) > 1 and r.arg[-1] is AxisType.REDUCE
 
 def _sched_peel_epilogue(val):
-  """(epilogue, bias_index_node, reduce_node) from a matmul store value, or (None,None,None).
-  Peels relu (max/where) -> silu (x*recip(1+exp2(x*C))) -> per-channel bias ADD, all structurally
-  on the clean schedule nodes. reduce_node is the REDUCE feeding the accumulator."""
-  epi, bias, v = 'plain', None, _strip_cast(val)
+  """(epilogue, bias_index_node, scale, bias_const, reduce_node) from a matmul store value, or all-None.
+  Peels relu (max/where) -> silu (x*recip(1+exp2(x*C))) -> scalar output SCALE (reduce*CONST, fused via
+  the DPU BS MUL stage, e.g. attention's 1/sqrt(d)) -> per-channel bias ADD (INDEX PARAM) OR scalar bias
+  ADD (reduce+CONST, fused via BS ALU), all structurally on the clean schedule nodes. reduce_node is the
+  REDUCE feeding the accumulator. `scale`/`bias_const` are Python floats (None = absent)."""
+  epi, bias, scale, bias_const, v = 'plain', None, None, None, _strip_cast(val)
   zc = lambda u: u.op is Ops.CONST and u.arg == 0
   if v.op is Ops.MAX and len(v.src) == 2 and any(zc(s) for s in v.src):
     epi = 'relu'; v = _strip_cast(next(s for s in v.src if not zc(s)))
@@ -722,15 +732,24 @@ def _sched_peel_epilogue(val):
         cs = [s for s in mul.src if s.op is Ops.CONST and abs(s.arg - _SILU_C_SCHED) < 1e-3]
         xs = [s for s in mul.src if not (s.op is Ops.CONST and abs(s.arg - _SILU_C_SCHED) < 1e-3)]
         if len(cs) == 1 and len(xs) == 1 and _strip_cast(xs[0]) is _strip_cast(x):
-          if epi == 'relu': return None, None, None
+          if epi == 'relu': return None, None, None, None, None
           epi = 'silu'; v = _strip_cast(x)
+  # scalar output scale: MUL(reduce, CONST). Not a silu (that consumed the MUL above). The const is on
+  # the accumulator, folded into BS MUL. relu(reduce*scale) is fine (BS order MUL -> ALU -> ReLU).
+  if epi != 'silu' and v.op is Ops.MUL and len(v.src) == 2:
+    cs = [s for s in v.src if s.op is Ops.CONST]
+    xs = [s for s in v.src if s.op is not Ops.CONST]
+    if len(cs) == 1 and len(xs) == 1 and _strip_cast(xs[0]).op is Ops.REDUCE:
+      scale = float(cs[0].arg); v = _strip_cast(xs[0])
   if v.op is Ops.ADD and len(v.src) == 2:
     reds = [s for s in v.src if _strip_cast(s).op is Ops.REDUCE]
     others = [s for s in v.src if _strip_cast(s).op is not Ops.REDUCE]
-    if len(reds) == 1 and len(others) == 1 and others[0].op is Ops.INDEX and others[0].src[0].op is Ops.PARAM:
-      bias = others[0]; v = _strip_cast(reds[0])
-  if v.op is not Ops.REDUCE: return None, None, None
-  return epi, bias, v
+    if len(reds) == 1 and len(others) == 1:
+      o = others[0]
+      if o.op is Ops.INDEX and o.src[0].op is Ops.PARAM: bias = o; v = _strip_cast(reds[0])
+      elif o.op is Ops.CONST: bias_const = float(o.arg); v = _strip_cast(reds[0])
+  if v.op is not Ops.REDUCE: return None, None, None, None, None
+  return epi, bias, scale, bias_const, v
 
 def _sched_match_matmul(sink):
   """Return dict(Bh,M,K,N,fn,relu,weight_t,bias_pidx,order,in_dt) if `sink` is a schedule-form
@@ -738,7 +757,7 @@ def _sched_match_matmul(sink):
   stores = [u for u in sink.toposort() if u.op is Ops.STORE]
   if len(stores) != 1: return None
   out_idx, val = stores[0].src[0], stores[0].src[1]
-  epi, bias, red = _sched_peel_epilogue(val)
+  epi, bias, scale, bias_const, red = _sched_peel_epilogue(val)
   if epi is None or red.arg is not Ops.ADD: return None
   red_ranges = [s for s in red.src[1:] if s.op is Ops.RANGE]
   if not red_ranges: return None
@@ -799,7 +818,8 @@ def _sched_match_matmul(sink):
   if (1 if M == 1 else 4) * K_pad * elem_bytes > avail * CBUF_BANK: return None
 
   if Bh > 1:
-    if fn != 'npu_matmul_fp16' or bias is not None or epi == 'silu': return None   # batched: fp16 plain/relu
+    if fn != 'npu_matmul_fp16' or bias is not None or epi == 'silu' \
+       or scale is not None or bias_const is not None: return None   # batched: fp16 plain/relu
   else:
     if layout == 'nk':
       fn = {'npu_matmul_fp16': 'npu_matmul_fp16_bt', 'npu_matmul_int8': 'npu_matmul_int8_bt'}.get(fn)
@@ -812,10 +832,18 @@ def _sched_match_matmul(sink):
     if any(c != 0 and r is not nr for r, c in rbias[1].items()) or rbias[1].get(nr, 0) != 1: return None
     if bias.src[0].dtype.base is not dtypes.half or bias.src[0].dtype.size != N: return None
     bias_pidx = bias.src[0].arg
+  # Scalar output scale (BS MUL) and scalar bias (BS ALU register) are fp16-only. Keep them mutually
+  # exclusive with each other and with per-channel bias -- each alone is validated; combined BS
+  # MUL+ALU ordering is untested, so a compound epilogue falls back to CPU.
+  if scale is not None and (fn not in ('npu_matmul_fp16', 'npu_matmul_fp16_bt') or bias_pidx is not None
+                            or bias_const is not None or (relu and scale <= 0)): return None
+  if bias_const is not None and (fn not in ('npu_matmul_fp16', 'npu_matmul_fp16_bt') or bias_pidx is not None):
+    return None
   if epi == 'silu':
     if fn != 'npu_matmul_fp16' or bias_pidx is not None or (M * N) % 8 != 0 or Bh > 1: return None
     fn = 'npu_matmul_fp16_silu'
-  return dict(kind='matmul', Bh=Bh, M=M, N=N, K=K, fn=fn, relu=relu, bias_pidx=bias_pidx, layout=layout)
+  return dict(kind='matmul', Bh=Bh, M=M, N=N, K=K, fn=fn, relu=relu, bias_pidx=bias_pidx, layout=layout,
+              scale=(1.0 if scale is None else scale), bias_const=(0.0 if bias_const is None else bias_const))
 
 def _sched_match_conv(sink):
   """Schedule-form conv2d match -> dict(kind='conv', N,Cin,IH,IW,Cout,KH,KW,sh,sw) or None.
