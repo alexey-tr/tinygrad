@@ -136,7 +136,8 @@ _lib.npu_matmul_fp16_batched.argtypes = [ctypes.c_int,
                                  ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_uint64,
                                  ctypes.c_void_p, ctypes.c_uint64,
-                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_float]
 
 # void npu_conv_fp16(int fd, void* dst_va, u64 dst_dma, u64 dst_obj, const void* feat_va, u64 feat_dma,
 #                    const void* weight_va, u64 weight_dma, int N,Cin,IH,IW,Cout,KH,KW,sh,sw,fp16_out)
@@ -407,6 +408,7 @@ class RkRenderer(ClangJITRenderer):
         i_out, i_A, i_B = ptr_indices[0], ptr_indices[1], ptr_indices[2]
         Bh, M, K, N = bmm['Bh'], bmm['M'], bmm['K'], bmm['N']
         weight_t = 1 if bmm['layout'] == 'nk' else 0   # nk (q@kᵀ) -> pre-transposed pack
+        scale = bmm.get('scale', 1.0)                  # fused scalar scale (BN MUL), e.g. attention 1/sqrt(d)
         # One call into npu_matmul_fp16_batched: it builds all Bh*tiles and submits them in a single
         # chained, multicore ioctl (the slices are contiguous, base ptr + internal s*M*K/K*N/M*N
         # offsets). Force threads=1 (the whole batch is one C call). The earlier serial-loop and the
@@ -415,7 +417,7 @@ class RkRenderer(ClangJITRenderer):
                 f"(void*){bufs[i_out][0]}, dma_{i_out}, obj_{i_out}, "
                 f"(const void*){bufs[i_A][0]}, dma_{i_A}, "
                 f"(const void*){bufs[i_B][0]}, dma_{i_B}, "
-                f"{Bh}, {M}, {K}, {N}, {weight_t}, 0);"]
+                f"{Bh}, {M}, {K}, {N}, {weight_t}, 0, {scale!r}f);"]
         self._npu_kernel_names.add(_strip_ansi(name))
         return self.render_kernel(name, body, bufs, uops)
 
@@ -528,7 +530,7 @@ class RkRenderer(ClangJITRenderer):
       'void npu_matmul_fp16_silu(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
       'void npu_matmul_fp16_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
       'void npu_matmul_int8_bt(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
-      'void npu_matmul_fp16_batched(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int batch, int M, int K, int N, int weight_t, int relu);',
+      'void npu_matmul_fp16_batched(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int batch, int M, int K, int N, int weight_t, int relu, float scale);',
       'void npu_conv_fp16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *feat_va, unsigned long long feat_dma, const void *weight_va, unsigned long long weight_dma, int N, int Cin, int IH, int IW, int Cout, int KH, int KW, int sh, int sw, int fp16_out);',
       'void npu_matmul_bf16(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
       'void npu_matmul_int8(int fd, void *dst_va, unsigned long long dst_dma, unsigned long long dst_obj, const void *a_va, unsigned long long a_dma, const void *b_va, unsigned long long b_dma, int M, int K, int N, int relu, float bias, const float *pcbias, float scale);',
@@ -814,8 +816,9 @@ def _sched_match_matmul(sink):
   if (1 if M == 1 else 4) * K_pad * elem_bytes > avail * CBUF_BANK: return None
 
   if Bh > 1:
-    if fn != 'npu_matmul_fp16' or bias is not None or epi == 'silu' \
-       or scale is not None or bias_const is not None: return None   # batched: fp16 plain/relu
+    # batched: fp16, plain/relu/scale (scale = per-slice BN MUL, e.g. attention 1/sqrt(d)).
+    # bias/scalar-bias/silu still unsupported on the batched path.
+    if fn != 'npu_matmul_fp16' or bias is not None or epi == 'silu' or bias_const is not None: return None
   else:
     if layout == 'nk':
       fn = {'npu_matmul_fp16': 'npu_matmul_fp16_bt', 'npu_matmul_int8': 'npu_matmul_int8_bt'}.get(fn)
